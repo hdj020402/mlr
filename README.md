@@ -1,6 +1,11 @@
 # mlr
 
-A reusable, domain-agnostic Multiple Linear Regression toolkit with memory-efficient chunked parquet data loading.
+A memory-efficient, domain-agnostic Multiple Linear Regression toolkit.
+
+- **Exact OLS and Ridge on arbitrarily large data** — Normal Equations accumulated batch-by-batch; memory cost is O(p²) in the number of features, independent of sample size.
+- **Pluggable methods** — OLS, Ridge, Lasso, ElasticNet, Huber.
+- **Unified data layer** — Parquet (row-group chunked), CSV (line-batched), or in-memory arrays/DataFrames through the same interface.
+- **Row-by-row Parquet writer** — build a Parquet file directly from memory without an intermediate CSV.
 
 ## Installation
 
@@ -8,88 +13,210 @@ A reusable, domain-agnostic Multiple Linear Regression toolkit with memory-effic
 pip install -e .
 ```
 
-## Quick Start
+## Project structure
+
+```
+src/mlr/
+├── converter.py   # ParquetWriter, csv_to_parquet
+├── dataset.py     # ParquetDataset, CSVDataset, MemoryDataset
+└── regression.py  # MLR
+```
+
+---
+
+## Data preparation
+
+### Option A — Write Parquet row by row (recommended)
+
+Use this when features are extracted one record at a time from individual
+source files.  `extract_features` is intentionally left to the caller —
+feature extraction is application-specific.
 
 ```python
-from mlr import ChunkedParquetLoader, MLR
+from mlr import ParquetWriter
 
-# 1. Load data from parquet (chunked, memory-efficient)
-loader = ChunkedParquetLoader(
+with ParquetWriter(
+    "output.parquet",
+    columns=["a", "b", "c", "y"],   # defines schema and column order
+    row_group_size=100_000,          # rows buffered before each flush
+    compression="snappy",
+) as writer:
+    for source_file in source_files:
+        row = extract_features(source_file)  # returns dict
+        writer.append(row)
+        # e.g. {"a": 1.2, "b": 3.4, "c": 5.6, "y": 0.9}
+```
+
+### Option B — Convert an existing CSV
+
+```python
+from mlr import csv_to_parquet
+
+csv_to_parquet(
+    "raw_data.csv",
+    "data.parquet",
+    batch_size=100_000,   # rows per row group
+    compression="snappy",
+)
+```
+
+---
+
+## Creating a dataset
+
+All three dataset types share the same `.feature_names` / `.iter_batches()` interface and can be passed directly to `MLR.fit`.
+
+### From Parquet
+
+```python
+from mlr import ParquetDataset
+
+ds = ParquetDataset(
+    "data.parquet",
+    feature_columns=["a", "b", "c"],   # columns to use as X
+    target_column="y",                  # column to use as y
+)
+```
+
+With an external array merged as a feature (e.g. predictions from another model):
+
+```python
+ds = ParquetDataset(
     "features.parquet",
-    external_columns={"pred": pred_array, "target": target_array},
+    feature_columns=["a", "b"],
+    external_columns={"pred": pred_array},   # 1-D array, len == file row count
+    target_column="y",
 )
+```
 
-# Discover available columns
-print(loader.columns)         # parquet 内部列名
-print(loader.external_column_names)  # 外部合并列名
+With the target coming from an external array:
 
-# 2. Load as numpy arrays
-X, y = loader.load_array(
-    feature_columns=["feature_a", "feature_b"],
-    index=[0, 1, 2, 3],          # only load specific rows
-    merge_columns=["pred"],       # prepend external columns to X
-    target_column="target",       # designate one external column as y
+```python
+ds = ParquetDataset(
+    "features.parquet",
+    feature_columns=["a", "b", "c"],
+    external_columns={"label": label_array},
+    target_column="label",   # resolved from external_columns first
 )
+```
 
-# 3. Fit model
-model = MLR(feature_names=["pred", "feature_a", "feature_b"])
-error = model.fit(X, y)  # returns {'MAE': ..., 'R2': ...}
+With a row subset:
 
-# 4. Predict
-prediction = model.predict(X_test)
+```python
+ds = ParquetDataset(
+    "data.parquet",
+    feature_columns=["a", "b", "c"],
+    target_column="y",
+    index_filter=[0, 1, 2, 100, 200],   # physical row positions (0-based)
+)
+```
 
-# 5. Save / Load coefficients
-model.save("coef.json", extra_info=error)
+### From CSV
+
+```python
+from mlr import CSVDataset
+
+ds = CSVDataset(
+    "data.csv",
+    feature_columns=["a", "b", "c"],
+    target_column="y",
+    batch_size=50_000,
+)
+```
+
+### From memory
+
+```python
+from mlr import MemoryDataset
+
+ds = MemoryDataset(X, y, feature_names=["a", "b", "c"])
+# feature_names inferred automatically if X is a pd.DataFrame
+```
+
+---
+
+## Fitting
+
+```python
+from mlr import MLR
+
+model = MLR(method="ols")
+metrics = model.fit(ds)       # {"MAE": ..., "R2": ...}
+print(model.coefficients)     # {"a": ..., "b": ..., "c": ..., "intercept": ...}
+```
+
+`feature_names` are taken from the dataset — no need to pass them separately.
+
+---
+
+## Prediction
+
+```python
+import numpy as np
+
+X_new = np.array([[1.0, 2.0, 3.0],
+                  [4.0, 5.0, 6.0]])
+pred = model.predict(X_new)   # shape (n, 1)
+```
+
+---
+
+## Save and load
+
+```python
+model.save("coef.json", extra_info=metrics)
+
 model2 = MLR()
 model2.load("coef.json")
-prediction2 = model2.predict(X_test)  # identical results
+pred2 = model2.predict(X_new)   # identical results
 ```
 
-## API
+Saved JSON format:
 
-### `ChunkedParquetLoader`
-
-Memory-efficient parquet loader that reads data in row groups, with support for index-based filtering and external column merging.
-
-| Method / Property | Description |
-|---|---|
-| `columns` | Column names in the parquet file |
-| `external_column_names` | Names of externally merged columns |
-| `iter_chunks(feature_columns, index, merge_columns, target_column)` | Generator yielding filtered `pd.DataFrame` chunks |
-| `load_array(feature_columns, index, merge_columns, target_column)` | Returns `(X, y)` as numpy arrays |
-
-**Parameters:**
-
-- `parquet_path` — Path to the parquet file.
-- `external_columns` — `dict[str, array_like]`, 1-D arrays aligned row-by-row with the parquet file.
-- `feature_columns` — Column names to read from parquet. `None` reads all.
-- `index` — Row indices to include. `None` includes all rows.
-- `merge_columns` — External column names to prepend to X (in order given).
-- `target_column` — One external column name used as y (not included in X).
-
-X column order: `[merge_columns..., feature_columns...]`
-
-### `MLR`
-
-Domain-agnostic multiple linear regression engine.
-
-| Method | Description |
-|---|---|
-| `fit(X, y)` | Fit OLS regression. Returns `{'MAE', 'R2'}`. |
-| `predict(X)` | Predict. Returns array of shape `(n, 1)`. |
-| `get_coefficients()` | Returns `dict` mapping feature names to coefficients, plus `'c'` for intercept. |
-| `save(path, extra_info)` | Save coefficients to JSON. Optionally include extra metadata. |
-| `load(path)` | Load coefficients from JSON (produced by `save`). |
-
-## Project Structure
-
+```json
+{
+  "method": "ols",
+  "fit_intercept": true,
+  "coefficients": {"a": 1.23, "b": -0.45, "c": 0.67, "intercept": 0.70},
+  "info": {"MAE": 0.008, "R2": 0.9999}
+}
 ```
-mlr/
-├── pyproject.toml
-├── README.md
-└── src/
-    └── mlr/
-        ├── __init__.py
-        ├── data.py          # ChunkedParquetLoader
-        └── regression.py    # MLR
+
+---
+
+## Regression methods
+
+| `method=`      | Description | Memory for fit |
+|---------------|-------------|----------------|
+| `"ols"`        | Ordinary Least Squares via batched Normal Equations. Exact solution. | O(p²) — bounded |
+| `"ridge"`      | L2 regularisation via batched Normal Equations. Exact solution. | O(p²) — bounded |
+| `"lasso"`      | L1 regularisation. Drives irrelevant coefficients to exactly zero. | Full data in RAM |
+| `"elasticnet"` | L1 + L2. Combines feature selection and coefficient stability. | Full data in RAM |
+| `"huber"`      | Robust regression. Reduces the influence of outliers. | Full data in RAM |
+
+For datasets that do not fit in RAM, use `method="ols"` or `method="ridge"`.
+
+### Key parameters
+
+```python
+MLR(
+    method="ols",
+    alpha=1.0,           # regularisation strength (ridge / lasso / elasticnet)
+    l1_ratio=0.5,        # 0 = pure Ridge, 1 = pure Lasso (elasticnet only)
+    huber_epsilon=1.35,  # outlier threshold (huber only)
+    fit_intercept=True,
+)
 ```
+
+---
+
+## Memory behaviour
+
+| Scenario | Memory usage |
+|----------|-------------|
+| OLS, N rows, p features | O(p²) — accumulators XᵀX and Xᵀy only |
+| Ridge, N rows, p features | O(p²) — same accumulators, alpha added to diagonal before solve |
+| Lasso / ElasticNet / Huber | O(N·p) — full data must fit in RAM (iterative solvers) |
+| Parquet read per batch | One row group at a time (size set at write time via `row_group_size` / `batch_size`) |
+| CSV read per batch | `batch_size` rows at a time |
+| `ParquetWriter` buffer | At most `row_group_size` rows at any time |
