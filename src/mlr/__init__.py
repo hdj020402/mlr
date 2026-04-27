@@ -37,3 +37,7 @@ def setup_logging(level: str = "INFO") -> None:
         sub_logger.propagate = False
 
     _configured = True
+
+
+# Auto-configure logging at import time with INFO level
+setup_logging()
