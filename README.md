@@ -150,11 +150,11 @@ print(model.coefficients)     # {"a": ..., "b": ..., "c": ..., "intercept": ...}
 ### All-zero feature handling
 
 OLS and Ridge automatically detect and exclude all-zero feature columns to avoid
-singular matrix issues.  These columns receive coefficient 0.  The excluded
-indices are available via `model.zero_col_indices`:
+singular matrix issues.  These columns receive coefficient 0.  The excluded feature names are
+available via `model.zero_col_features`:
 
 ```python
-print(model.zero_col_indices)  # e.g. [2, 5, 11] — column positions that are all-zero
+print(model.zero_col_features)  # e.g. ["feat_c", "feat_f"] — names of all-zero features
 ```
 
 ### Selecting metrics
@@ -203,7 +203,7 @@ Saved JSON format:
   "method": "ols",
   "fit_intercept": true,
   "coefficients": {"a": 1.23, "b": -0.45, "c": 0.67, "intercept": 0.70},
-  "zero_col_indices": [],
+  "zero_col_features": [],
   "info": {"MAE": 0.008, "R2": 0.9999}
 }
 ```
