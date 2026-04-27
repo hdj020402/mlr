@@ -63,6 +63,9 @@ class ParquetDataset:
                           of the same name.
         index_filter:     Optional list of physical row positions (0-based)
                           to include.  Rows not in this list are skipped.
+        max_rows_per_batch:  Maximum rows per yielded batch.  If a single
+                          row group exceeds this, it is split into
+                          sub-batches.  Default 100_000.
     """
 
     def __init__(
@@ -72,18 +75,16 @@ class ParquetDataset:
         target_column: str,
         external_columns: dict[str, np.ndarray | list] | None = None,
         index_filter: list[int] | None = None,
+        max_rows_per_batch: int = 100_000,
     ) -> None:
         self._pf = pq.ParquetFile(parquet_path)
         self.parquet_path = parquet_path
         self.feature_names: list[str] = list(feature_columns)
         self._target_column = target_column
+        self._max_rows = max_rows_per_batch
 
-        # Discover total row count via a minimal read (one column only)
-        first_col = self._pf.schema.names[0]
-        _tmp = pd.read_parquet(parquet_path, columns=[first_col])
-        self._num_rows: int = len(_tmp)
-        del _tmp
-        gc.collect()
+        # Discover total row count via PyArrow metadata (no data read)
+        self._num_rows: int = self._pf.metadata.num_rows
 
         # Validate and store external columns as aligned Series
         self._ext: dict[str, pd.Series] = {}
@@ -115,7 +116,11 @@ class ParquetDataset:
         return self._pf.schema.names
 
     def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
-        """Yield (X, y) numpy arrays one row group at a time."""
+        """Yield (X, y) numpy arrays one row group at a time.
+
+        If a row group exceeds max_rows_per_batch, it is split into
+        sub-batches to bound memory usage.
+        """
         logger.info(
             f"Reading parquet: {self._num_rows} rows, "
             f"{self._pf.num_row_groups} row groups"
@@ -138,24 +143,34 @@ class ParquetDataset:
         cursor = 0
         batch_count = 0
         for rg_idx in range(self._pf.num_row_groups):
-            chunk = self._pf.read_row_group(rg_idx, columns=cols_to_read).to_pandas()
-            n = len(chunk)
-            chunk.index = pd.RangeIndex(start=cursor, stop=cursor + n)
-            cursor += n
+            # Read entire row group (cannot read partial row groups)
+            rg = self._pf.read_row_group(rg_idx, columns=cols_to_read)
+            rg_len = rg.num_rows
 
-            if self._filter_set is not None:
-                chunk = chunk[chunk.index.isin(self._filter_set)].copy()
+            # Process in sub-batches; each sub-batch converts only max_rows to pandas
+            for start in range(0, rg_len, self._max_rows):
+                end = min(start + self._max_rows, rg_len)
+                chunk = rg.slice(start, end - start).to_pandas()
+                n = len(chunk)
+                chunk.index = pd.RangeIndex(start=cursor + start, stop=cursor + start + n)
 
-            if chunk.empty:
+                if self._filter_set is not None:
+                    chunk = chunk[chunk.index.isin(self._filter_set)].copy()
+
+                if chunk.empty:
+                    del chunk
+                    gc.collect()
+                    continue
+
+                X, y = self._build_arrays(chunk)
                 del chunk
                 gc.collect()
-                continue
+                batch_count += 1
+                yield X, y
 
-            X, y = self._build_arrays(chunk)
-            del chunk
+            cursor += rg_len
+            del rg
             gc.collect()
-            batch_count += 1
-            yield X, y
 
         logger.debug(f"Finished reading parquet: yielded {batch_count} batches")
 
@@ -179,6 +194,28 @@ class ParquetDataset:
         else:
             y = chunk[[self._target_column]].values
         y = y.astype(np.float64)
+
+        # Validate: check for NaN/inf (warn only once per dataset instance)
+        if not getattr(self, '_warned_nan', False):
+            if not np.isfinite(X).all():
+                nan_mask = ~np.isfinite(X)
+                nan_cols = np.where(nan_mask.any(axis=0))[0]
+                parts = []
+                for col_idx in nan_cols:
+                    nan_rows = np.where(nan_mask[:, col_idx])[0]
+                    col_name = self.feature_names[col_idx]
+                    source = "external" if col_name in self._ext else "parquet"
+                    parts.append(
+                        f"  column '{col_name}' ({source}): {len(nan_rows)} bad values, "
+                        f"first at batch row {nan_rows[0]}"
+                    )
+                logger.warning(f"X contains NaN/inf:\n" + "\n".join(parts))
+                self._warned_nan = True
+            if not np.isfinite(y).all():
+                nan_count = (~np.isfinite(y)).sum()
+                source = "external" if self._target_column in self._ext else "parquet"
+                logger.warning(f"y contains NaN/inf: {nan_count} bad values (source={source})")
+                self._warned_nan = True
 
         return X, y
 
@@ -218,6 +255,7 @@ class CSVDataset:
             set(index_filter) if index_filter is not None else None
         )
         self._read_csv_kwargs = read_csv_kwargs
+        self._warned_nan = False
 
         logger.info(
             f"CSVDataset: {csv_path}, batch_size={batch_size}, "
@@ -256,6 +294,26 @@ class CSVDataset:
 
             X = chunk[self.feature_names].values.astype(np.float64)
             y = chunk[[self._target_column]].values.astype(np.float64)
+
+            # Validate: check for NaN/inf (warn only once)
+            if not self._warned_nan:
+                if not np.isfinite(X).all():
+                    nan_mask = ~np.isfinite(X)
+                    nan_cols = np.where(nan_mask.any(axis=0))[0]
+                    parts = []
+                    for col_idx in nan_cols:
+                        nan_rows = np.where(nan_mask[:, col_idx])[0]
+                        col_name = self.feature_names[col_idx]
+                        parts.append(
+                            f"  column '{col_name}': {len(nan_rows)} bad values, "
+                            f"first at batch row {nan_rows[0]}"
+                        )
+                    logger.warning(f"X contains NaN/inf:\n" + "\n".join(parts))
+                    self._warned_nan = True
+                if not np.isfinite(y).all():
+                    nan_count = (~np.isfinite(y)).sum()
+                    logger.warning(f"y contains NaN/inf: {nan_count} bad values")
+                    self._warned_nan = True
             del chunk
             gc.collect()
             batch_count += 1
@@ -292,6 +350,23 @@ class MemoryDataset:
                 f"x{i}" for i in range(self._X.shape[1])
             ]
         self._y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+
+        # Validate: check for NaN/inf
+        if not np.isfinite(self._X).all():
+            nan_mask = ~np.isfinite(self._X)
+            nan_cols = np.where(nan_mask.any(axis=0))[0]
+            parts = []
+            for col_idx in nan_cols:
+                nan_rows = np.where(nan_mask[:, col_idx])[0]
+                col_name = self.feature_names[col_idx]
+                parts.append(
+                    f"  column '{col_name}': {len(nan_rows)} bad values, "
+                    f"first at row {nan_rows[0]}"
+                )
+            logger.warning(f"X contains NaN/inf:\n" + "\n".join(parts))
+        if not np.isfinite(self._y).all():
+            nan_count = (~np.isfinite(self._y)).sum()
+            logger.warning(f"y contains NaN/inf: {nan_count} bad values")
 
         logger.info(
             f"MemoryDataset: X={self._X.shape}, y={self._y.shape}, "
