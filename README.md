@@ -147,6 +147,31 @@ print(model.coefficients)     # {"a": ..., "b": ..., "c": ..., "intercept": ...}
 
 `feature_names` are taken from the dataset — no need to pass them separately.
 
+### All-zero feature handling
+
+OLS and Ridge automatically detect and exclude all-zero feature columns to avoid
+singular matrix issues.  These columns receive coefficient 0.  The excluded
+indices are available via `model.zero_col_indices`:
+
+```python
+print(model.zero_col_indices)  # e.g. [2, 5, 11] — column positions that are all-zero
+```
+
+### Selecting metrics
+
+```python
+metrics = model.fit(ds, metrics=["MAE", "RMSE"])
+```
+
+Available metrics: `"MAE"`, `"R2"`, `"MSE"`, `"RMSE"` (default: all four).
+
+### Saving predictions
+
+```python
+model.save_predictions(ds, "predictions.parquet")            # fitted values on training data
+model.save_predictions(X_new, "new_predictions.parquet")     # predictions on new data
+```
+
 ---
 
 ## Prediction
@@ -178,6 +203,7 @@ Saved JSON format:
   "method": "ols",
   "fit_intercept": true,
   "coefficients": {"a": 1.23, "b": -0.45, "c": 0.67, "intercept": 0.70},
+  "zero_col_indices": [],
   "info": {"MAE": 0.008, "R2": 0.9999}
 }
 ```
@@ -188,8 +214,8 @@ Saved JSON format:
 
 | `method=`      | Description | Memory for fit |
 |---------------|-------------|----------------|
-| `"ols"`        | Ordinary Least Squares via batched Normal Equations. Exact solution. | O(p²) — bounded |
-| `"ridge"`      | L2 regularisation via batched Normal Equations. Exact solution. | O(p²) — bounded |
+| `"ols"`        | Ordinary Least Squares via batched Normal Equations. Exact solution. Auto-excludes all-zero columns. | O(p²) — bounded |
+| `"ridge"`      | L2 regularisation via batched Normal Equations. Exact solution. Auto-excludes all-zero columns. | O(p²) — bounded |
 | `"lasso"`      | L1 regularisation. Drives irrelevant coefficients to exactly zero. | Full data in RAM |
 | `"elasticnet"` | L1 + L2. Combines feature selection and coefficient stability. | Full data in RAM |
 | `"huber"`      | Robust regression. Reduces the influence of outliers. | Full data in RAM |
