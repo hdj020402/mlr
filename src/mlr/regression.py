@@ -10,11 +10,18 @@ OLS (method="ols")
     once at the end.  This gives bitwise-identical results to loading
     all data at once.
 
+    All-zero feature columns are automatically detected and excluded
+    from the solve to avoid singular matrix issues.  These columns
+    receive coefficient 0.  The excluded column indices are stored
+    in ``model.zero_col_indices``.
+
 Ridge (method="ridge")
     Exact solution via the same batched Normal Equations as OLS, with an
     L2 penalty term added to the diagonal of XtX before solving:
         theta = (XtX + alpha * I)^{-1} Xty
     Memory cost is also O(p²) and independent of sample size.
+
+    All-zero columns are handled identically to OLS.
 
 Iterative methods (method="lasso" | "elasticnet" | "huber")
     These have no closed-form solution and rely on sklearn iterative
@@ -30,6 +37,7 @@ Public interface
     model.fit(dataset, metrics=["MAE", "RMSE"])  # optionally select metrics
     pred  = model.predict(X)                 # numpy array
     coef  = model.coefficients               # dict {name: value, ..., "intercept": value}
+    model.zero_col_indices                   # list of excluded all-zero column indices
     model.save("coef.json")
     model.load("coef.json")
     model.save_predictions(dataset, "pred.parquet")   # save fitted values
@@ -92,6 +100,12 @@ class MLR:
         huber_epsilon: Robustness parameter for Huber (values above this
                        threshold are treated as outliers).  Default 1.35.
         fit_intercept: Whether to fit an intercept term.  Default True.
+
+    Attributes:
+        zero_col_indices: List of feature column indices that were detected
+                          as all-zero and excluded from the solve.  These
+                          columns have coefficient 0.  Empty for sklearn
+                          methods.
     """
 
     def __init__(
@@ -118,6 +132,7 @@ class MLR:
         self.coef_: np.ndarray | None = None
         self.intercept_: float = 0.0
         self._sklearn_model = None
+        self.zero_col_indices: list[int] = []
 
     # ------------------------------------------------------------------
     # Public interface
@@ -188,6 +203,8 @@ class MLR:
     def coefficients(self) -> dict[str, float]:
         """Named coefficient dict: {feature_name: coef, ..., "intercept": value}.
 
+        Includes all original features; all-zero features have coefficient 0.
+
         Raises:
             RuntimeError: If the model has not been fitted or loaded.
         """
@@ -210,6 +227,7 @@ class MLR:
             "method": self.method,
             "fit_intercept": self.fit_intercept,
             "coefficients": self.coefficients,
+            "zero_col_indices": self.zero_col_indices,
         }
         if extra_info:
             payload["info"] = extra_info
@@ -233,6 +251,7 @@ class MLR:
         self.feature_names = list(coef_dict.keys())
         self.coef_ = np.array(list(coef_dict.values()))
         self._sklearn_model = None
+        self.zero_col_indices = payload.get("zero_col_indices", [])
         logger.info(f"Model loaded from {path}")
 
     def save_predictions(
@@ -317,12 +336,16 @@ class MLR:
         of ones before accumulation so the intercept is part of the same
         solve.  This is identical to the closed-form solution on the
         full dataset but requires only O(p²) memory.
+
+        Automatically detects and excludes all-zero feature columns to
+        avoid singular matrix issues.  These columns get coefficient 0.
         """
         p = len(dataset.feature_names)
         aug_p = p + 1 if self.fit_intercept else p
 
         XtX = np.zeros((aug_p, aug_p), dtype=np.float64)
         Xty = np.zeros((aug_p, 1), dtype=np.float64)
+        col_sum = np.zeros(p, dtype=np.float64)
         n_total = 0
 
         logger.info("Reading data: accumulating batches...")
@@ -335,6 +358,7 @@ class MLR:
 
             XtX += X_aug.T @ X_aug
             Xty += X_aug.T @ y_batch
+            col_sum += X_batch.sum(axis=0)
             n_total += len(X_batch)
             batch_mem = X_batch.nbytes + y_batch.nbytes
             logger.debug(
@@ -342,15 +366,48 @@ class MLR:
                 f"batch={batch_mem / 1024 / 1024:.1f} MB"
             )
 
-        logger.info(f"OLS solve: {n_total} total rows, {aug_p} parameters")
-        theta = np.linalg.lstsq(XtX, Xty, rcond=None)[0].flatten()
+        # Detect all-zero columns
+        zero_mask = (col_sum == 0.0)
+        zero_indices = list(np.where(zero_mask)[0])
+        active_indices = list(np.where(~zero_mask)[0])
 
-        if self.fit_intercept:
-            self.coef_ = theta[:p]
-            self.intercept_ = float(theta[p])
+        if zero_indices:
+            logger.info(
+                f"Excluding {len(zero_indices)} all-zero features: "
+                f"[{', '.join(self.feature_names[i] for i in zero_indices)}]"
+            )
+
+        logger.info(f"OLS solve: {n_total} total rows, {len(active_indices)} active parameters")
+
+        if len(active_indices) == 0:
+            # All features are zero - trivial case
+            self.coef_ = np.zeros(p, dtype=np.float64)
+            if self.fit_intercept:
+                self.intercept_ = 0.0
         else:
-            self.coef_ = theta
-            self.intercept_ = 0.0
+            # Build reduced XtX and Xty for active features only
+            if self.fit_intercept:
+                # active_indices + [p] (intercept column is at index p)
+                active_with_intercept = active_indices + [p]
+                XtX_reduced = XtX[np.ix_(active_with_intercept, active_with_intercept)]
+                Xty_reduced = Xty[active_with_intercept]
+            else:
+                XtX_reduced = XtX[np.ix_(active_indices, active_indices)]
+                Xty_reduced = Xty[active_indices]
+
+            theta_reduced = np.linalg.lstsq(XtX_reduced, Xty_reduced, rcond=None)[0].flatten()
+
+            # Expand back to full coefficient vector
+            self.coef_ = np.zeros(p, dtype=np.float64)
+            self.coef_[active_indices] = theta_reduced[:len(active_indices)]
+
+            if self.fit_intercept:
+                self.intercept_ = float(theta_reduced[-1])
+            else:
+                self.intercept_ = 0.0
+
+        # Store zero column indices for reference
+        self.zero_col_indices = zero_indices
 
         return self._eval_metrics(dataset, metrics)
 
@@ -364,12 +421,15 @@ class MLR:
             theta = (XtX + alpha * I_features)^{-1} Xty
 
         Memory cost is O(p²), same as OLS.
+
+        Automatically detects and excludes all-zero feature columns.
         """
         p = len(dataset.feature_names)
         aug_p = p + 1 if self.fit_intercept else p
 
         XtX = np.zeros((aug_p, aug_p), dtype=np.float64)
         Xty = np.zeros((aug_p, 1), dtype=np.float64)
+        col_sum = np.zeros(p, dtype=np.float64)
         n_total = 0
 
         logger.info("Reading data: accumulating batches...")
@@ -382,6 +442,7 @@ class MLR:
 
             XtX += X_aug.T @ X_aug
             Xty += X_aug.T @ y_batch
+            col_sum += X_batch.sum(axis=0)
             n_total += len(X_batch)
             batch_mem = X_batch.nbytes + y_batch.nbytes
             logger.debug(
@@ -389,18 +450,51 @@ class MLR:
                 f"batch={batch_mem / 1024 / 1024:.1f} MB"
             )
 
-        # Add L2 penalty to feature dimensions only (not the intercept column)
-        XtX[:p, :p] += self.alpha * np.eye(p, dtype=np.float64)
+        # Detect all-zero columns
+        zero_mask = (col_sum == 0.0)
+        zero_indices = list(np.where(zero_mask)[0])
+        active_indices = list(np.where(~zero_mask)[0])
 
-        logger.info(f"Ridge solve: {n_total} total rows, alpha={self.alpha}")
-        theta = np.linalg.solve(XtX, Xty).flatten()
+        if zero_indices:
+            logger.info(
+                f"Excluding {len(zero_indices)} all-zero features: "
+                f"[{', '.join(self.feature_names[i] for i in zero_indices)}]"
+            )
 
-        if self.fit_intercept:
-            self.coef_ = theta[:p]
-            self.intercept_ = float(theta[p])
+        # Add L2 penalty to active feature dimensions only
+        if active_indices:
+            XtX[np.ix_(active_indices, active_indices)] += self.alpha * np.eye(len(active_indices), dtype=np.float64)
+
+        logger.info(f"Ridge solve: {n_total} total rows, {len(active_indices)} active parameters, alpha={self.alpha}")
+
+        if len(active_indices) == 0:
+            # All features are zero - trivial case
+            self.coef_ = np.zeros(p, dtype=np.float64)
+            if self.fit_intercept:
+                self.intercept_ = 0.0
         else:
-            self.coef_ = theta
-            self.intercept_ = 0.0
+            # Build reduced system for active features
+            if self.fit_intercept:
+                active_with_intercept = active_indices + [p]
+                XtX_reduced = XtX[np.ix_(active_with_intercept, active_with_intercept)]
+                Xty_reduced = Xty[active_with_intercept]
+            else:
+                XtX_reduced = XtX[np.ix_(active_indices, active_indices)]
+                Xty_reduced = Xty[active_indices]
+
+            theta_reduced = np.linalg.solve(XtX_reduced, Xty_reduced).flatten()
+
+            # Expand back to full coefficient vector
+            self.coef_ = np.zeros(p, dtype=np.float64)
+            self.coef_[active_indices] = theta_reduced[:len(active_indices)]
+
+            if self.fit_intercept:
+                self.intercept_ = float(theta_reduced[-1])
+            else:
+                self.intercept_ = 0.0
+
+        # Store zero column indices for reference
+        self.zero_col_indices = zero_indices
 
         return self._eval_metrics(dataset, metrics)
 
@@ -451,6 +545,7 @@ class MLR:
             result["R2"] = float(r2_score(y_all, y_pred))
         del X_all, y_all
 
+        self.zero_col_indices = []  # sklearn handles zero columns naturally
         return result
 
     def _eval_metrics(self, dataset, metrics: list[str]) -> dict[str, float]:
