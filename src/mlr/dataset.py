@@ -116,6 +116,11 @@ class ParquetDataset:
 
     def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
         """Yield (X, y) numpy arrays one row group at a time."""
+        logger.info(
+            f"Reading parquet: {self._num_rows} rows, "
+            f"{self._pf.num_row_groups} row groups"
+        )
+
         # Determine which columns to read from the file
         file_feature_cols = [
             c for c in self.feature_names if c not in self._ext
@@ -131,6 +136,7 @@ class ParquetDataset:
             cols_to_read = [self._pf.schema.names[0]]
 
         cursor = 0
+        batch_count = 0
         for rg_idx in range(self._pf.num_row_groups):
             chunk = self._pf.read_row_group(rg_idx, columns=cols_to_read).to_pandas()
             n = len(chunk)
@@ -148,7 +154,10 @@ class ParquetDataset:
             X, y = self._build_arrays(chunk)
             del chunk
             gc.collect()
+            batch_count += 1
             yield X, y
+
+        logger.debug(f"Finished reading parquet: yielded {batch_count} batches")
 
     def _build_arrays(
         self, chunk: pd.DataFrame
@@ -217,6 +226,10 @@ class CSVDataset:
 
     def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
         """Yield (X, y) numpy arrays one batch at a time."""
+        logger.info(
+            f"Reading CSV: batch_size={self._batch_size}"
+        )
+
         usecols = self.feature_names + [self._target_column]
         reader = pd.read_csv(
             self.csv_path,
@@ -225,6 +238,7 @@ class CSVDataset:
             **self._read_csv_kwargs,
         )
         row_cursor = 0
+        batch_count = 0
         for chunk in reader:
             chunk_len = len(chunk)
             if self._filter_set is not None:
@@ -244,7 +258,10 @@ class CSVDataset:
             y = chunk[[self._target_column]].values.astype(np.float64)
             del chunk
             gc.collect()
+            batch_count += 1
             yield X, y
+
+        logger.debug(f"Finished reading CSV: yielded {batch_count} batches")
 
 
 class MemoryDataset:
