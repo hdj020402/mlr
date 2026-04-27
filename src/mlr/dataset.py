@@ -106,7 +106,7 @@ class ParquetDataset:
         logger.info(
             f"ParquetDataset: {parquet_path}, {self._num_rows} rows, "
             f"{self._pf.num_row_groups} row groups, "
-            f"features={self.feature_names}"
+            f"n_features={len(self.feature_names)}"
         )
 
     @property
@@ -221,7 +221,7 @@ class CSVDataset:
 
         logger.info(
             f"CSVDataset: {csv_path}, batch_size={batch_size}, "
-            f"features={self.feature_names}"
+            f"n_features={len(self.feature_names)}"
         )
 
     def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
@@ -295,7 +295,7 @@ class MemoryDataset:
 
         logger.info(
             f"MemoryDataset: X={self._X.shape}, y={self._y.shape}, "
-            f"features={self.feature_names}"
+            f"n_features={len(self.feature_names)}"
         )
 
     def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":

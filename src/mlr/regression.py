@@ -37,7 +37,7 @@ Public interface
     model.fit(dataset, metrics=["MAE", "RMSE"])  # optionally select metrics
     pred  = model.predict(X)                 # numpy array
     coef  = model.coefficients               # dict {name: value, ..., "intercept": value}
-    model.zero_col_indices                   # list of excluded all-zero column indices
+    model.zero_col_features                # list of excluded all-zero feature names
     model.save("coef.json")
     model.load("coef.json")
     model.save_predictions(dataset, "pred.parquet")   # save fitted values
@@ -102,10 +102,10 @@ class MLR:
         fit_intercept: Whether to fit an intercept term.  Default True.
 
     Attributes:
-        zero_col_indices: List of feature column indices that were detected
-                          as all-zero and excluded from the solve.  These
-                          columns have coefficient 0.  Empty for sklearn
-                          methods.
+        zero_col_features: List of feature names that were detected as
+                           all-zero and excluded from the solve.  These
+                           columns have coefficient 0.  Empty for sklearn
+                           methods.
     """
 
     def __init__(
@@ -132,7 +132,7 @@ class MLR:
         self.coef_: np.ndarray | None = None
         self.intercept_: float = 0.0
         self._sklearn_model = None
-        self.zero_col_indices: list[int] = []
+        self.zero_col_features: list[str] = []
 
     # ------------------------------------------------------------------
     # Public interface
@@ -227,7 +227,7 @@ class MLR:
             "method": self.method,
             "fit_intercept": self.fit_intercept,
             "coefficients": self.coefficients,
-            "zero_col_indices": self.zero_col_indices,
+            "zero_col_features": self.zero_col_features,
         }
         if extra_info:
             payload["info"] = extra_info
@@ -251,7 +251,7 @@ class MLR:
         self.feature_names = list(coef_dict.keys())
         self.coef_ = np.array(list(coef_dict.values()))
         self._sklearn_model = None
-        self.zero_col_indices = payload.get("zero_col_indices", [])
+        self.zero_col_features = payload.get("zero_col_features", [])
         logger.info(f"Model loaded from {path}")
 
     def save_predictions(
@@ -368,14 +368,16 @@ class MLR:
 
         # Detect all-zero columns
         zero_mask = (col_sum == 0.0)
-        zero_indices = list(np.where(zero_mask)[0])
-        active_indices = list(np.where(~zero_mask)[0])
+        zero_indices = [int(i) for i in np.where(zero_mask)[0]]
+        active_indices = [int(i) for i in np.where(~zero_mask)[0]]
 
         if zero_indices:
+            self.zero_col_features = [self.feature_names[i] for i in zero_indices]
             logger.info(
-                f"Excluding {len(zero_indices)} all-zero features: "
-                f"[{', '.join(self.feature_names[i] for i in zero_indices)}]"
+                f"Excluding {len(zero_indices)} all-zero features"
             )
+        else:
+            self.zero_col_features = []
 
         logger.info(f"OLS solve: {n_total} total rows, {len(active_indices)} active parameters")
 
@@ -405,9 +407,6 @@ class MLR:
                 self.intercept_ = float(theta_reduced[-1])
             else:
                 self.intercept_ = 0.0
-
-        # Store zero column indices for reference
-        self.zero_col_indices = zero_indices
 
         return self._eval_metrics(dataset, metrics)
 
@@ -452,14 +451,16 @@ class MLR:
 
         # Detect all-zero columns
         zero_mask = (col_sum == 0.0)
-        zero_indices = list(np.where(zero_mask)[0])
-        active_indices = list(np.where(~zero_mask)[0])
+        zero_indices = [int(i) for i in np.where(zero_mask)[0]]
+        active_indices = [int(i) for i in np.where(~zero_mask)[0]]
 
         if zero_indices:
+            self.zero_col_features = [self.feature_names[i] for i in zero_indices]
             logger.info(
-                f"Excluding {len(zero_indices)} all-zero features: "
-                f"[{', '.join(self.feature_names[i] for i in zero_indices)}]"
+                f"Excluding {len(zero_indices)} all-zero features"
             )
+        else:
+            self.zero_col_features = []
 
         # Add L2 penalty to active feature dimensions only
         if active_indices:
@@ -492,9 +493,6 @@ class MLR:
                 self.intercept_ = float(theta_reduced[-1])
             else:
                 self.intercept_ = 0.0
-
-        # Store zero column indices for reference
-        self.zero_col_indices = zero_indices
 
         return self._eval_metrics(dataset, metrics)
 
@@ -545,7 +543,7 @@ class MLR:
             result["R2"] = float(r2_score(y_all, y_pred))
         del X_all, y_all
 
-        self.zero_col_indices = []  # sklearn handles zero columns naturally
+        self.zero_col_features = []  # sklearn handles zero columns naturally
         return result
 
     def _eval_metrics(self, dataset, metrics: list[str]) -> dict[str, float]:
