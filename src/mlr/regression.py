@@ -275,10 +275,7 @@ class MLR:
                             actual y values alongside predictions.
             batch_size:     Number of rows per write chunk.
         """
-        feature_names = self.feature_names or [f"x{i}" for i in range(len(self.coef_))]
-
-        columns: dict[str, list] = {name: [] for name in feature_names}
-        columns["predicted"] = []
+        columns: dict[str, list] = {"predicted": []}
         if include_actuals and hasattr(source, "iter_batches"):
             columns["actual"] = []
 
@@ -287,7 +284,7 @@ class MLR:
 
         def _flush() -> None:
             nonlocal written, sink
-            if not columns[feature_names[0]]:
+            if not columns["predicted"]:
                 return
             table = pa.table(columns)
             if sink is None:
@@ -301,8 +298,6 @@ class MLR:
             for start in range(0, len(source), batch_size):
                 batch = source[start : start + batch_size]
                 pred = self.predict(batch).flatten()
-                for i, name in enumerate(feature_names):
-                    columns[name].extend(batch[:, i].tolist())
                 columns["predicted"].extend(pred.tolist())
                 if len(columns["predicted"]) >= batch_size:
                     _flush()
@@ -311,8 +306,6 @@ class MLR:
             # dataset object
             for X_batch, y_batch in source.iter_batches():
                 pred = self.predict(X_batch).flatten()
-                for i, name in enumerate(feature_names):
-                    columns[name].extend(X_batch[:, i].tolist())
                 columns["predicted"].extend(pred.tolist())
                 if include_actuals:
                     columns["actual"].extend(y_batch.flatten().tolist())
