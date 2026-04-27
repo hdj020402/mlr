@@ -324,45 +324,30 @@ class MLR:
     def _fit_ols(self, dataset, metrics: list[str]) -> dict[str, float]:
         """Exact OLS via batched Normal Equations accumulation.
 
-        Accumulates  XtX += X.T @ X  and  Xty += X.T @ y  for each
-        batch.  If fit_intercept is True, X is augmented with a column
-        of ones before accumulation so the intercept is part of the same
-        solve.  This is identical to the closed-form solution on the
-        full dataset but requires only O(p²) memory.
+        Uses a two-pass approach:
+        1. Scan to detect all-zero feature columns.
+        2. Accumulate XtX and Xty using only active columns.
 
-        Automatically detects and excludes all-zero feature columns to
-        avoid singular matrix issues.  These columns get coefficient 0.
+        This avoids O(p²) wasted computation on all-zero features.
         """
         p = len(dataset.feature_names)
-        aug_p = p + 1 if self.fit_intercept else p
 
-        XtX = np.zeros((aug_p, aug_p), dtype=np.float64)
-        Xty = np.zeros((aug_p, 1), dtype=np.float64)
-        col_sum = np.zeros(p, dtype=np.float64)
+        # Pass 1: detect all-zero columns (use absolute sum to avoid cancellation)
+        col_abs_sum = np.zeros(p, dtype=np.float64)
         n_total = 0
-
-        logger.info("Reading data: accumulating batches...")
+        logger.info("Pass 1: scanning for all-zero features...")
         for X_batch, y_batch in dataset.iter_batches():
-            if self.fit_intercept:
-                ones = np.ones((len(X_batch), 1), dtype=np.float64)
-                X_aug = np.hstack([X_batch, ones])
-            else:
-                X_aug = X_batch
-
-            XtX += X_aug.T @ X_aug
-            Xty += X_aug.T @ y_batch
-            col_sum += X_batch.sum(axis=0)
+            col_abs_sum += np.abs(X_batch).sum(axis=0)
             n_total += len(X_batch)
-            batch_mem = X_batch.nbytes + y_batch.nbytes
             logger.debug(
-                f"OLS accumulate: processed {n_total} rows, "
-                f"batch={batch_mem / 1024 / 1024:.1f} MB"
+                f"Pass 1 scan: processed {n_total} rows, "
+                f"batch={X_batch.nbytes + y_batch.nbytes / 1024 / 1024:.1f} MB"
             )
 
-        # Detect all-zero columns
-        zero_mask = (col_sum == 0.0)
+        zero_mask = (col_abs_sum == 0.0)
         zero_indices = [int(i) for i in np.where(zero_mask)[0]]
         active_indices = [int(i) for i in np.where(~zero_mask)[0]]
+        active_p = len(active_indices)
 
         if zero_indices:
             self.zero_col_features = [self.feature_names[i] for i in zero_indices]
@@ -372,29 +357,49 @@ class MLR:
         else:
             self.zero_col_features = []
 
-        logger.info(f"OLS solve: {n_total} total rows, {len(active_indices)} active parameters")
+        # Pass 2: accumulate XtX/Xty using only active columns
+        active_aug_p = active_p + 1 if self.fit_intercept else active_p
+        XtX = np.zeros((active_aug_p, active_aug_p), dtype=np.float64)
+        Xty = np.zeros((active_aug_p, 1), dtype=np.float64)
+        n_total = 0
 
-        if len(active_indices) == 0:
+        logger.info(f"Pass 2: accumulating with {active_p} active features...")
+        for X_batch, y_batch in dataset.iter_batches():
+            # Select only active columns
+            X_active = X_batch[:, active_indices]
+
+            if self.fit_intercept:
+                ones = np.ones((len(X_active), 1), dtype=np.float64)
+                X_aug = np.hstack([X_active, ones])
+            else:
+                X_aug = X_active
+
+            XtX += X_aug.T @ X_aug
+            Xty += X_aug.T @ y_batch
+            n_total += len(X_batch)
+            batch_mem = X_batch.nbytes + y_batch.nbytes
+            logger.debug(
+                f"Pass 2 accumulate: processed {n_total} rows, "
+                f"batch={batch_mem / 1024 / 1024:.1f} MB"
+            )
+
+        logger.info(f"OLS solve: {n_total} total rows, {active_p} active parameters")
+
+        if active_p == 0:
             # All features are zero - trivial case
             self.coef_ = np.zeros(p, dtype=np.float64)
             if self.fit_intercept:
                 self.intercept_ = 0.0
         else:
-            # Build reduced XtX and Xty for active features only
-            if self.fit_intercept:
-                # active_indices + [p] (intercept column is at index p)
-                active_with_intercept = active_indices + [p]
-                XtX_reduced = XtX[np.ix_(active_with_intercept, active_with_intercept)]
-                Xty_reduced = Xty[active_with_intercept]
-            else:
-                XtX_reduced = XtX[np.ix_(active_indices, active_indices)]
-                Xty_reduced = Xty[active_indices]
+            # Add tiny regularisation for numerical stability
+            lambda_small = 1e-12 * np.trace(XtX) / XtX.shape[0]
+            XtX += lambda_small * np.eye(XtX.shape[0])
 
-            theta_reduced = np.linalg.lstsq(XtX_reduced, Xty_reduced, rcond=None)[0].flatten()
+            theta_reduced = np.linalg.solve(XtX, Xty).flatten()
 
             # Expand back to full coefficient vector
             self.coef_ = np.zeros(p, dtype=np.float64)
-            self.coef_[active_indices] = theta_reduced[:len(active_indices)]
+            self.coef_[active_indices] = theta_reduced[:active_p]
 
             if self.fit_intercept:
                 self.intercept_ = float(theta_reduced[-1])
@@ -406,46 +411,31 @@ class MLR:
     def _fit_ridge(self, dataset, metrics: list[str]) -> dict[str, float]:
         """Exact Ridge via batched Normal Equations with L2 penalty.
 
-        Identical accumulation loop as OLS.  After all batches are
-        processed, alpha is added to the diagonal of XtX (excluding
-        the intercept row/column when fit_intercept is True) before
-        solving:
-            theta = (XtX + alpha * I_features)^{-1} Xty
+        Uses a two-pass approach:
+        1. Scan to detect all-zero feature columns.
+        2. Accumulate XtX and Xty using only active columns, then add
+           L2 penalty and solve.
 
-        Memory cost is O(p²), same as OLS.
-
-        Automatically detects and excludes all-zero feature columns.
+        This avoids O(p²) wasted computation on all-zero features.
         """
         p = len(dataset.feature_names)
-        aug_p = p + 1 if self.fit_intercept else p
 
-        XtX = np.zeros((aug_p, aug_p), dtype=np.float64)
-        Xty = np.zeros((aug_p, 1), dtype=np.float64)
-        col_sum = np.zeros(p, dtype=np.float64)
+        # Pass 1: detect all-zero columns (use absolute sum to avoid cancellation)
+        col_abs_sum = np.zeros(p, dtype=np.float64)
         n_total = 0
-
-        logger.info("Reading data: accumulating batches...")
+        logger.info("Pass 1: scanning for all-zero features...")
         for X_batch, y_batch in dataset.iter_batches():
-            if self.fit_intercept:
-                ones = np.ones((len(X_batch), 1), dtype=np.float64)
-                X_aug = np.hstack([X_batch, ones])
-            else:
-                X_aug = X_batch
-
-            XtX += X_aug.T @ X_aug
-            Xty += X_aug.T @ y_batch
-            col_sum += X_batch.sum(axis=0)
+            col_abs_sum += np.abs(X_batch).sum(axis=0)
             n_total += len(X_batch)
-            batch_mem = X_batch.nbytes + y_batch.nbytes
             logger.debug(
-                f"Ridge accumulate: processed {n_total} rows, "
-                f"batch={batch_mem / 1024 / 1024:.1f} MB"
+                f"Pass 1 scan: processed {n_total} rows, "
+                f"batch={X_batch.nbytes + y_batch.nbytes / 1024 / 1024:.1f} MB"
             )
 
-        # Detect all-zero columns
-        zero_mask = (col_sum == 0.0)
+        zero_mask = (col_abs_sum == 0.0)
         zero_indices = [int(i) for i in np.where(zero_mask)[0]]
         active_indices = [int(i) for i in np.where(~zero_mask)[0]]
+        active_p = len(active_indices)
 
         if zero_indices:
             self.zero_col_features = [self.feature_names[i] for i in zero_indices]
@@ -455,32 +445,53 @@ class MLR:
         else:
             self.zero_col_features = []
 
+        # Pass 2: accumulate XtX/Xty using only active columns
+        active_aug_p = active_p + 1 if self.fit_intercept else active_p
+        XtX = np.zeros((active_aug_p, active_aug_p), dtype=np.float64)
+        Xty = np.zeros((active_aug_p, 1), dtype=np.float64)
+        n_total = 0
+
+        logger.info(f"Pass 2: accumulating with {active_p} active features...")
+        for X_batch, y_batch in dataset.iter_batches():
+            # Select only active columns
+            X_active = X_batch[:, active_indices]
+
+            if self.fit_intercept:
+                ones = np.ones((len(X_active), 1), dtype=np.float64)
+                X_aug = np.hstack([X_active, ones])
+            else:
+                X_aug = X_active
+
+            XtX += X_aug.T @ X_aug
+            Xty += X_aug.T @ y_batch
+            n_total += len(X_batch)
+            batch_mem = X_batch.nbytes + y_batch.nbytes
+            logger.debug(
+                f"Pass 2 accumulate: processed {n_total} rows, "
+                f"batch={batch_mem / 1024 / 1024:.1f} MB"
+            )
+
         # Add L2 penalty to active feature dimensions only
-        if active_indices:
-            XtX[np.ix_(active_indices, active_indices)] += self.alpha * np.eye(len(active_indices), dtype=np.float64)
+        if active_p > 0:
+            XtX[:active_p, :active_p] += self.alpha * np.eye(active_p, dtype=np.float64)
 
-        logger.info(f"Ridge solve: {n_total} total rows, {len(active_indices)} active parameters, alpha={self.alpha}")
+        logger.info(f"Ridge solve: {n_total} total rows, {active_p} active parameters, alpha={self.alpha}")
 
-        if len(active_indices) == 0:
+        if active_p == 0:
             # All features are zero - trivial case
             self.coef_ = np.zeros(p, dtype=np.float64)
             if self.fit_intercept:
                 self.intercept_ = 0.0
         else:
-            # Build reduced system for active features
-            if self.fit_intercept:
-                active_with_intercept = active_indices + [p]
-                XtX_reduced = XtX[np.ix_(active_with_intercept, active_with_intercept)]
-                Xty_reduced = Xty[active_with_intercept]
-            else:
-                XtX_reduced = XtX[np.ix_(active_indices, active_indices)]
-                Xty_reduced = Xty[active_indices]
+            # Add tiny regularisation for numerical stability
+            lambda_small = 1e-12 * np.trace(XtX) / XtX.shape[0]
+            XtX += lambda_small * np.eye(XtX.shape[0])
 
-            theta_reduced = np.linalg.solve(XtX_reduced, Xty_reduced).flatten()
+            theta_reduced = np.linalg.solve(XtX, Xty).flatten()
 
             # Expand back to full coefficient vector
             self.coef_ = np.zeros(p, dtype=np.float64)
-            self.coef_[active_indices] = theta_reduced[:len(active_indices)]
+            self.coef_[active_indices] = theta_reduced[:active_p]
 
             if self.fit_intercept:
                 self.intercept_ = float(theta_reduced[-1])
@@ -540,24 +551,29 @@ class MLR:
         return result
 
     def _eval_metrics(self, dataset, metrics: list[str]) -> dict[str, float]:
-        """Compute requested metrics over the full dataset in batches."""
+        """Compute requested metrics over the full dataset in batches.
+
+        Uses two passes to avoid storing all predictions in memory:
+        1. Accumulate sums for MAE/MSE and compute y_mean.
+        2. Compute ss_tot for R2 using only y_mean.
+        """
         logger.info("Computing evaluation metrics...")
 
         sum_ae = 0.0
         sum_se = 0.0
-        y_mean_acc = 0.0
+        y_sum = 0.0
+        y_sq_sum = 0.0
         n = 0
 
         # Pass 1: predict and accumulate running sums
-        y_preds, y_actuals = [], []
         for X_batch, y_batch in dataset.iter_batches():
             y_pred_batch = self.predict(X_batch)
-            y_preds.append(y_pred_batch)
-            y_actuals.append(y_batch)
+            residuals = y_pred_batch - y_batch
             n += len(y_batch)
-            sum_ae += np.abs(y_pred_batch - y_batch).sum()
-            sum_se += ((y_pred_batch - y_batch) ** 2).sum()
-            y_mean_acc += y_batch.sum()
+            sum_ae += np.abs(residuals).sum()
+            sum_se += (residuals ** 2).sum()
+            y_sum += y_batch.sum()
+            y_sq_sum += (y_batch ** 2).sum()
             batch_mem = X_batch.nbytes + y_batch.nbytes + y_pred_batch.nbytes
             logger.debug(
                 f"Evaluating: processed {n} rows, "
@@ -565,20 +581,30 @@ class MLR:
             )
 
         result: dict[str, float] = {}
-        if "MAE" in metrics:
-            result["MAE"] = float(sum_ae / n)
-        if "MSE" in metrics:
-            result["MSE"] = float(sum_se / n)
-        if "RMSE" in metrics:
-            result["RMSE"] = float(np.sqrt(sum_se / n))
+        if n == 0:
+            logger.warning("No data for evaluation")
+            if "MAE" in metrics:
+                result["MAE"] = float("nan")
+            if "MSE" in metrics:
+                result["MSE"] = float("nan")
+            if "RMSE" in metrics:
+                result["RMSE"] = float("nan")
+            if "R2" in metrics:
+                result["R2"] = float("nan")
+        else:
+            if "MAE" in metrics:
+                result["MAE"] = float(sum_ae / n)
+            if "MSE" in metrics:
+                result["MSE"] = float(sum_se / n)
+            if "RMSE" in metrics:
+                result["RMSE"] = float(np.sqrt(sum_se / n))
 
-        if "R2" in metrics:
-            y_mean = y_mean_acc / n
-            ss_tot = 0.0
-            for yp, ya in zip(y_preds, y_actuals):
-                ss_tot += ((ya - y_mean) ** 2).sum()
-            ss_res = sum_se
-            result["R2"] = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+            if "R2" in metrics:
+                y_mean = y_sum / n
+                # ss_tot = sum((y - y_mean)^2) = sum(y^2) - n * y_mean^2
+                ss_tot = y_sq_sum - n * y_mean ** 2
+                ss_res = sum_se
+                result["R2"] = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
 
         log_parts = [f"{k}={v:.6f}" for k, v in result.items()]
         logger.info(f"Train metrics: {', '.join(log_parts)}")
