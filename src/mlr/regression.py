@@ -339,10 +339,7 @@ class MLR:
         for X_batch, y_batch in dataset.iter_batches():
             col_abs_sum += np.abs(X_batch).sum(axis=0)
             n_total += len(X_batch)
-            logger.debug(
-                f"Pass 1 scan: processed {n_total} rows, "
-                f"batch={X_batch.nbytes + y_batch.nbytes / 1024 / 1024:.1f} MB"
-            )
+            logger.debug(f"Pass 1 scan: processed {n_total} rows")
 
         zero_mask = (col_abs_sum == 0.0)
         zero_indices = [int(i) for i in np.where(zero_mask)[0]]
@@ -377,11 +374,7 @@ class MLR:
             XtX += X_aug.T @ X_aug
             Xty += X_aug.T @ y_batch
             n_total += len(X_batch)
-            batch_mem = X_batch.nbytes + y_batch.nbytes
-            logger.debug(
-                f"Pass 2 accumulate: processed {n_total} rows, "
-                f"batch={batch_mem / 1024 / 1024:.1f} MB"
-            )
+            logger.debug(f"Pass 2 accumulate: processed {n_total} rows")
 
         logger.info(f"OLS solve: {n_total} total rows, {active_p} active parameters")
 
@@ -427,10 +420,7 @@ class MLR:
         for X_batch, y_batch in dataset.iter_batches():
             col_abs_sum += np.abs(X_batch).sum(axis=0)
             n_total += len(X_batch)
-            logger.debug(
-                f"Pass 1 scan: processed {n_total} rows, "
-                f"batch={X_batch.nbytes + y_batch.nbytes / 1024 / 1024:.1f} MB"
-            )
+            logger.debug(f"Pass 1 scan: processed {n_total} rows")
 
         zero_mask = (col_abs_sum == 0.0)
         zero_indices = [int(i) for i in np.where(zero_mask)[0]]
@@ -465,11 +455,7 @@ class MLR:
             XtX += X_aug.T @ X_aug
             Xty += X_aug.T @ y_batch
             n_total += len(X_batch)
-            batch_mem = X_batch.nbytes + y_batch.nbytes
-            logger.debug(
-                f"Pass 2 accumulate: processed {n_total} rows, "
-                f"batch={batch_mem / 1024 / 1024:.1f} MB"
-            )
+            logger.debug(f"Pass 2 accumulate: processed {n_total} rows")
 
         # Add L2 penalty to active feature dimensions only
         if active_p > 0:
@@ -574,11 +560,7 @@ class MLR:
             sum_se += (residuals ** 2).sum()
             y_sum += y_batch.sum()
             y_sq_sum += (y_batch ** 2).sum()
-            batch_mem = X_batch.nbytes + y_batch.nbytes + y_pred_batch.nbytes
-            logger.debug(
-                f"Evaluating: processed {n} rows, "
-                f"batch={batch_mem / 1024 / 1024:.1f} MB"
-            )
+            logger.debug(f"Evaluating: processed {n} rows")
 
         result: dict[str, float] = {}
         if n == 0:
