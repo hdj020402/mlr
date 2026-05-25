@@ -133,6 +133,7 @@ class MLR:
         self.intercept_: float = 0.0
         self._sklearn_model = None
         self.zero_col_features: list[str] = []
+        self.n_samples_: int = 0
 
     # ------------------------------------------------------------------
     # Public interface
@@ -226,11 +227,12 @@ class MLR:
         payload: dict[str, Any] = {
             "method": self.method,
             "fit_intercept": self.fit_intercept,
+            "n_samples": self.n_samples_,
             "coefficients": self.coefficients,
             "zero_col_features": self.zero_col_features,
         }
         if extra_info:
-            payload["info"] = extra_info
+            payload["metrics"] = extra_info
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
         logger.info(f"Model saved to {path}")
@@ -399,6 +401,7 @@ class MLR:
             else:
                 self.intercept_ = 0.0
 
+        self.n_samples_ = n_total
         return self._eval_metrics(dataset, metrics)
 
     def _fit_ridge(self, dataset, metrics: list[str]) -> dict[str, float]:
@@ -484,6 +487,7 @@ class MLR:
             else:
                 self.intercept_ = 0.0
 
+        self.n_samples_ = n_total
         return self._eval_metrics(dataset, metrics)
 
     def _fit_sklearn(self, dataset, metrics: list[str]) -> dict[str, float]:
@@ -531,6 +535,7 @@ class MLR:
             result["RMSE"] = float(np.sqrt(mean_squared_error(y_all, y_pred)))
         if "R2" in metrics:
             result["R2"] = float(r2_score(y_all, y_pred))
+        self.n_samples_ = len(y_all)
         del X_all, y_all
 
         self.zero_col_features = []  # sklearn handles zero columns naturally
