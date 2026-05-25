@@ -31,12 +31,54 @@ Example – in-memory:
 
 import gc
 import logging
+from collections.abc import Iterator
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
+
+_VALID_NAN_POLICIES = ("raise", "drop")
+
+
+def _check_nan_policy(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: list[str],
+    nan_policy: Literal["raise", "drop"],
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Apply nan_policy to X and y arrays.
+
+    Returns (filtered_X, filtered_y, n_dropped).
+    Raises ValueError in 'raise' mode if bad values exist.
+    """
+    invalid_x = ~np.isfinite(X)
+    invalid_y = ~np.isfinite(y).flatten()
+    invalid_mask = invalid_x.any(axis=1) | invalid_y
+
+    n_invalid = int(invalid_mask.sum())
+    if n_invalid == 0:
+        return X, y, 0
+
+    if nan_policy == "raise":
+        parts = []
+        cols_with_invalid = np.where(invalid_x.any(axis=0))[0]
+        for col_idx in cols_with_invalid:
+            col_count = int(invalid_x[:, col_idx].sum())
+            parts.append(f"  feature '{feature_names[col_idx]}': {col_count} bad values")
+        if invalid_y.any():
+            parts.append(f"  target: {int(invalid_y.sum())} bad values")
+        raise ValueError(
+            f"Data contains {n_invalid} rows with NaN/inf. "
+            f"Details:\n" + "\n".join(parts)
+        )
+
+    # drop
+    valid_mask = ~invalid_mask
+    logger.warning(f"Dropping {n_invalid} rows with NaN/inf ({n_invalid}/{len(X)})")
+    return X[valid_mask], y[valid_mask], n_invalid
 
 
 class ParquetDataset:
@@ -76,7 +118,11 @@ class ParquetDataset:
         external_columns: dict[str, np.ndarray | list] | None = None,
         index_filter: list[int] | None = None,
         max_rows_per_batch: int = 100_000,
+        nan_policy: Literal["raise", "drop"] = "raise",
     ) -> None:
+        if nan_policy not in _VALID_NAN_POLICIES:
+            raise ValueError(f"nan_policy must be one of {_VALID_NAN_POLICIES}")
+        self._nan_policy = nan_policy
         self._pf = pq.ParquetFile(parquet_path)
         self.parquet_path = parquet_path
         self.feature_names: list[str] = list(feature_columns)
@@ -115,7 +161,7 @@ class ParquetDataset:
         """All column names available in the Parquet file."""
         return self._pf.schema.names
 
-    def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
+    def iter_batches(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Yield (X, y) numpy arrays one row group at a time.
 
         If a row group exceeds max_rows_per_batch, it is split into
@@ -165,6 +211,8 @@ class ParquetDataset:
                 X, y = self._build_arrays(chunk)
                 del chunk
                 gc.collect()
+                if len(X) == 0:
+                    continue
                 batch_count += 1
                 yield X, y
 
@@ -195,28 +243,7 @@ class ParquetDataset:
             y = chunk[[self._target_column]].values
         y = y.astype(np.float64)
 
-        # Validate: check for NaN/inf (warn only once per dataset instance)
-        if not getattr(self, '_warned_nan', False):
-            if not np.isfinite(X).all():
-                nan_mask = ~np.isfinite(X)
-                nan_cols = np.where(nan_mask.any(axis=0))[0]
-                parts = []
-                for col_idx in nan_cols:
-                    nan_rows = np.where(nan_mask[:, col_idx])[0]
-                    col_name = self.feature_names[col_idx]
-                    source = "external" if col_name in self._ext else "parquet"
-                    parts.append(
-                        f"  column '{col_name}' ({source}): {len(nan_rows)} bad values, "
-                        f"first at batch row {nan_rows[0]}"
-                    )
-                logger.warning(f"X contains NaN/inf:\n" + "\n".join(parts))
-                self._warned_nan = True
-            if not np.isfinite(y).all():
-                nan_count = (~np.isfinite(y)).sum()
-                source = "external" if self._target_column in self._ext else "parquet"
-                logger.warning(f"y contains NaN/inf: {nan_count} bad values (source={source})")
-                self._warned_nan = True
-
+        X, y, _ = _check_nan_policy(X, y, self.feature_names, self._nan_policy)
         return X, y
 
 
@@ -245,8 +272,12 @@ class CSVDataset:
         target_column: str,
         batch_size: int = 100_000,
         index_filter: list[int] | None = None,
+        nan_policy: Literal["raise", "drop"] = "raise",
         **read_csv_kwargs,
     ) -> None:
+        if nan_policy not in _VALID_NAN_POLICIES:
+            raise ValueError(f"nan_policy must be one of {_VALID_NAN_POLICIES}")
+        self._nan_policy = nan_policy
         self.csv_path = csv_path
         self.feature_names: list[str] = list(feature_columns)
         self._target_column = target_column
@@ -255,14 +286,13 @@ class CSVDataset:
             set(index_filter) if index_filter is not None else None
         )
         self._read_csv_kwargs = read_csv_kwargs
-        self._warned_nan = False
 
         logger.info(
             f"CSVDataset: {csv_path}, batch_size={batch_size}, "
             f"n_features={len(self.feature_names)}"
         )
 
-    def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
+    def iter_batches(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Yield (X, y) numpy arrays one batch at a time."""
         logger.info(
             f"Reading CSV: batch_size={self._batch_size}"
@@ -295,27 +325,11 @@ class CSVDataset:
             X = chunk[self.feature_names].values.astype(np.float64)
             y = chunk[[self._target_column]].values.astype(np.float64)
 
-            # Validate: check for NaN/inf (warn only once)
-            if not self._warned_nan:
-                if not np.isfinite(X).all():
-                    nan_mask = ~np.isfinite(X)
-                    nan_cols = np.where(nan_mask.any(axis=0))[0]
-                    parts = []
-                    for col_idx in nan_cols:
-                        nan_rows = np.where(nan_mask[:, col_idx])[0]
-                        col_name = self.feature_names[col_idx]
-                        parts.append(
-                            f"  column '{col_name}': {len(nan_rows)} bad values, "
-                            f"first at batch row {nan_rows[0]}"
-                        )
-                    logger.warning(f"X contains NaN/inf:\n" + "\n".join(parts))
-                    self._warned_nan = True
-                if not np.isfinite(y).all():
-                    nan_count = (~np.isfinite(y)).sum()
-                    logger.warning(f"y contains NaN/inf: {nan_count} bad values")
-                    self._warned_nan = True
+            X, y, _ = _check_nan_policy(X, y, self.feature_names, self._nan_policy)
             del chunk
             gc.collect()
+            if len(X) == 0:
+                continue
             batch_count += 1
             yield X, y
 
@@ -340,7 +354,10 @@ class MemoryDataset:
         X: np.ndarray | pd.DataFrame,
         y: np.ndarray | pd.Series,
         feature_names: list[str] | None = None,
+        nan_policy: Literal["raise", "drop"] = "raise",
     ) -> None:
+        if nan_policy not in _VALID_NAN_POLICIES:
+            raise ValueError(f"nan_policy must be one of {_VALID_NAN_POLICIES}")
         if isinstance(X, pd.DataFrame):
             self.feature_names: list[str] = feature_names or list(X.columns)
             self._X = X.values.astype(np.float64)
@@ -351,28 +368,15 @@ class MemoryDataset:
             ]
         self._y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
 
-        # Validate: check for NaN/inf
-        if not np.isfinite(self._X).all():
-            nan_mask = ~np.isfinite(self._X)
-            nan_cols = np.where(nan_mask.any(axis=0))[0]
-            parts = []
-            for col_idx in nan_cols:
-                nan_rows = np.where(nan_mask[:, col_idx])[0]
-                col_name = self.feature_names[col_idx]
-                parts.append(
-                    f"  column '{col_name}': {len(nan_rows)} bad values, "
-                    f"first at row {nan_rows[0]}"
-                )
-            logger.warning(f"X contains NaN/inf:\n" + "\n".join(parts))
-        if not np.isfinite(self._y).all():
-            nan_count = (~np.isfinite(self._y)).sum()
-            logger.warning(f"y contains NaN/inf: {nan_count} bad values")
+        self._X, self._y, _ = _check_nan_policy(
+            self._X, self._y, self.feature_names, nan_policy
+        )
 
         logger.info(
             f"MemoryDataset: X={self._X.shape}, y={self._y.shape}, "
             f"n_features={len(self.feature_names)}"
         )
 
-    def iter_batches(self) -> "Generator[tuple[np.ndarray, np.ndarray]]":
+    def iter_batches(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Yield the entire dataset as a single batch."""
         yield self._X, self._y
