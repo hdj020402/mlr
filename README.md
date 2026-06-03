@@ -18,8 +18,9 @@ pip install -e .
 ```
 src/mlr/
 ├── converter.py   # ParquetWriter, csv_to_parquet
-├── dataset.py     # ParquetDataset, CSVDataset, MemoryDataset
-└── regression.py  # MLR
+├── dataset.py     # ParquetDataset, CSVDataset, MemoryDataset, split_dataset
+├── regression.py  # MLR
+└── validation.py  # cross_validate
 ```
 
 ---
@@ -141,29 +142,61 @@ ds = MemoryDataset(X, y, feature_names=["a", "b", "c"])
 from mlr import MLR
 
 model = MLR(method="ols")
-metrics = model.fit(ds)       # {"MAE": ..., "R2": ...}
+result = model.fit(ds)
+# result -> {"metrics": {"train": {"MAE": ..., "R2": ..., "MSE": ..., "RMSE": ...}}}
 print(model.coefficients)     # {"a": ..., "b": ..., "c": ..., "intercept": ...}
 ```
 
 `feature_names` are taken from the dataset — no need to pass them separately.
 
-### All-zero feature handling
+### Train / test split
 
-OLS and Ridge automatically detect and exclude all-zero feature columns to avoid
-singular matrix issues.  These columns receive coefficient 0.  The excluded feature names are
-available via `model.zero_col_features`:
+Pass `test_size` to hold out a fraction of rows for unbiased evaluation:
 
 ```python
-print(model.zero_col_features)  # e.g. ["feat_c", "feat_f"] — names of all-zero features
+result = model.fit(ds, test_size=0.2, random_state=42)
+# result -> {"metrics": {"train": {...}, "test": {...}}}
+print(result["metrics"]["train"]["R2"])   # e.g. 0.9994
+print(result["metrics"]["test"]["R2"])    # e.g. 0.9987
 ```
+
+### Train / validation / test split
+
+Pass both `test_size` and `val_size` for a three-way split:
+
+```python
+result = model.fit(ds, test_size=0.2, val_size=0.1, random_state=42)
+# result -> {"metrics": {"train": {...}, "val": {...}, "test": {...}}}
+```
+
+When no split is requested (the default), the model fits on all data and only reports training metrics.
+
+### Standalone evaluation
+
+Use `evaluate()` to compute metrics on any dataset without re-fitting:
+
+```python
+model.evaluate(some_other_ds, metrics=["MAE", "R2"])
+# -> {"MAE": 0.08, "R2": 0.999}
+```
+
+Raises `RuntimeError` if called before the model is fitted or loaded.
 
 ### Selecting metrics
 
 ```python
-metrics = model.fit(ds, metrics=["MAE", "RMSE"])
+result = model.fit(ds, metrics=["MAE", "RMSE"])
 ```
 
 Available metrics: `"MAE"`, `"R2"`, `"MSE"`, `"RMSE"` (default: all four).
+
+### All-zero feature handling
+
+OLS and Ridge automatically detect and exclude all-zero feature columns to avoid singular matrix issues. These columns receive coefficient 0. The excluded feature names are available via `model.zero_col_features`:
+
+```python
+print(model.zero_col_features)  # e.g. ["feat_c", "feat_f"] — names of all-zero features
+```
 
 ### Saving predictions
 
@@ -186,10 +219,51 @@ pred = model.predict(X_new)   # shape (n, 1)
 
 ---
 
+## Dataset splitting
+
+Use `split_dataset` to create independent train/validation/test subsets from any dataset type without loading all data into memory.
+
+```python
+from mlr import split_dataset
+
+# Train / test split (80/20)
+train_ds, test_ds = split_dataset(ds, test_size=0.2, random_state=42)
+
+# Train / validation / test split (70/10/20)
+train_ds, val_ds, test_ds = split_dataset(
+    ds, test_size=0.2, val_size=0.1, random_state=42,
+)
+```
+
+For `MemoryDataset` the arrays are sliced directly. For `ParquetDataset` and `CSVDataset` the existing `index_filter` mechanism is used so no data is copied. The returned subsets are independent dataset objects that can be passed to `MLR.fit()` or `MLR.evaluate()`.
+
+---
+
+## Cross-validation
+
+K-fold cross-validation is provided by `cross_validate`. It clones the model template for each fold, fits on the training portion, and returns per-fold results including coefficients, training metrics, and validation metrics.
+
+```python
+from mlr import cross_validate, MLR
+
+model = MLR(method="ols")
+scores = cross_validate(model, ds, cv=5, metrics=["MAE", "R2"], random_state=42)
+
+for fold_name, fold_info in scores.items():
+    print(fold_name, fold_info["coefficients"], fold_info["metrics"]["val"]["R2"])
+# fold_1 {'a': 1.23, 'b': -2.01, 'intercept': 0.30} 0.9991
+# fold_2 {'a': 1.25, 'b': -1.98, 'intercept': 0.31} 0.9988
+# ...
+```
+
+Works with any method, including Lasso and ElasticNet where cross-validation is essential for tuning the regularisation strength.
+
+---
+
 ## Save and load
 
 ```python
-model.save("coef.json", extra_info=metrics)
+model.save("coef.json", extra_info=result["metrics"]["train"])
 
 model2 = MLR()
 model2.load("coef.json")
@@ -202,9 +276,10 @@ Saved JSON format:
 {
   "method": "ols",
   "fit_intercept": true,
+  "n_samples": 200,
   "coefficients": {"a": 1.23, "b": -0.45, "c": 0.67, "intercept": 0.70},
   "zero_col_features": [],
-  "info": {"MAE": 0.008, "R2": 0.9999}
+  "metrics": {"MAE": 0.008, "R2": 0.9999}
 }
 ```
 

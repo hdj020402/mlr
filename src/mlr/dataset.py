@@ -9,6 +9,10 @@ All sources expose the same API:
     dataset.feature_names   -> list[str]
     dataset.iter_batches()  -> Iterator[tuple[np.ndarray, np.ndarray]]
 
+Splitting:
+    split_dataset(dataset, test_size=0.2)              -> (train_ds, test_ds)
+    split_dataset(dataset, test_size=0.2, val_size=0.1) -> (train_ds, val_ds, test_ds)
+
 Example – Parquet with external columns:
     >>> ds = ParquetDataset(
     ...     "features.parquet",
@@ -358,6 +362,7 @@ class MemoryDataset:
     ) -> None:
         if nan_policy not in _VALID_NAN_POLICIES:
             raise ValueError(f"nan_policy must be one of {_VALID_NAN_POLICIES}")
+        self._nan_policy = nan_policy
         if isinstance(X, pd.DataFrame):
             self.feature_names: list[str] = feature_names or list(X.columns)
             self._X = X.values.astype(np.float64)
@@ -380,3 +385,137 @@ class MemoryDataset:
     def iter_batches(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Yield the entire dataset as a single batch."""
         yield self._X, self._y
+
+
+# ------------------------------------------------------------------
+# Dataset splitting utilities
+# ------------------------------------------------------------------
+
+
+def _count_csv_rows(csv_path: str) -> int:
+    """Count data rows in a CSV file (excluding header).
+
+    Counts newline characters for speed; does not parse CSV.
+    NOTE: newlines inside quoted fields will cause miscounting.
+    """
+    with open(csv_path, "rb") as f:
+        n_lines = sum(1 for _ in f)
+    return max(0, n_lines - 1)
+
+
+def _get_num_rows(dataset) -> int:
+    """Return the total number of rows for any dataset type."""
+    if isinstance(dataset, ParquetDataset):
+        return dataset._num_rows
+    elif isinstance(dataset, CSVDataset):
+        return _count_csv_rows(dataset.csv_path)
+    elif isinstance(dataset, MemoryDataset):
+        return len(dataset._X)
+    else:
+        raise TypeError(f"Unsupported dataset type: {type(dataset)}")
+
+
+def _make_subset(dataset, indices: list[int]):
+    """Create a subset of *dataset* containing only the given row indices.
+
+    For ParquetDataset and CSVDataset this uses **index_filter** to
+    avoid copying data.  For MemoryDataset the arrays are sliced directly.
+    """
+    if isinstance(dataset, ParquetDataset):
+        ext_arrays = (
+            {name: series.values for name, series in dataset._ext.items()}
+            if dataset._ext else None
+        )
+        return ParquetDataset(
+            parquet_path=dataset.parquet_path,
+            feature_columns=list(dataset.feature_names),
+            target_column=dataset._target_column,
+            external_columns=ext_arrays,
+            index_filter=list(indices),
+            max_rows_per_batch=dataset._max_rows,
+            nan_policy=dataset._nan_policy,
+        )
+    elif isinstance(dataset, CSVDataset):
+        return CSVDataset(
+            csv_path=dataset.csv_path,
+            feature_columns=list(dataset.feature_names),
+            target_column=dataset._target_column,
+            batch_size=dataset._batch_size,
+            index_filter=list(indices),
+            nan_policy=dataset._nan_policy,
+            **dataset._read_csv_kwargs,
+        )
+    elif isinstance(dataset, MemoryDataset):
+        X_sub = dataset._X[indices]
+        y_sub = dataset._y[indices]
+        return MemoryDataset(
+            X_sub, y_sub,
+            feature_names=list(dataset.feature_names),
+            nan_policy=dataset._nan_policy,
+        )
+    else:
+        raise TypeError(f"Unsupported dataset type: {type(dataset)}")
+
+
+def split_dataset(
+    dataset,
+    test_size: float = 0.2,
+    val_size: float = 0.0,
+    random_state: int | None = None,
+):
+    """Split a dataset into train / validation / test subsets.
+
+    Args:
+        dataset:      Any dataset object (ParquetDataset, CSVDataset,
+                      or MemoryDataset).
+        test_size:    Fraction of rows reserved for testing.
+                      Must be in (0, 1).  Default 0.2.
+        val_size:     Fraction of rows reserved for validation.
+                      Must be in [0, 1 - test_size).  Default 0.
+        random_state: Seed or numpy RandomState for reproducibility.
+
+    Returns:
+        ``(train_ds, test_ds)`` if *val_size* is 0;
+        ``(train_ds, val_ds, test_ds)`` if *val_size* > 0.
+
+    Raises:
+        ValueError:  If any size is out of bounds.
+        TypeError:   If *dataset* is not a recognised dataset type.
+    """
+    if not 0 < test_size < 1:
+        raise ValueError(
+            f"test_size must be in (0, 1), got {test_size}"
+        )
+    if not 0 <= val_size < 1 - test_size:
+        raise ValueError(
+            f"val_size must be in [0, {1 - test_size}), got {val_size}"
+        )
+
+    n = _get_num_rows(dataset)
+    rng = np.random.RandomState(random_state)
+    indices = rng.permutation(n)
+
+    n_test = int(n * test_size)
+    n_val = int(n * val_size)
+
+    test_idx = indices[-n_test:] if n_test > 0 else np.array([], dtype=int)
+    if val_size > 0:
+        val_idx = indices[-(n_test + n_val):-n_test]
+        train_idx = indices[:-(n_test + n_val)]
+    else:
+        val_idx = None
+        train_idx = indices[:-n_test] if n_test > 0 else indices
+
+    train_ds = _make_subset(dataset, train_idx.tolist())
+    test_ds = _make_subset(dataset, test_idx.tolist())
+
+    logger.info(
+        f"split_dataset: test_size={test_size}, val_size={val_size}, "
+        f"n_total={n} -> train={len(train_idx)}, test={len(test_idx)}"
+        + (f", val={len(val_idx)}" if val_size > 0 else "")
+    )
+
+    if val_size > 0:
+        val_ds = _make_subset(dataset, val_idx.tolist())
+        return train_ds, val_ds, test_ds
+    return train_ds, test_ds

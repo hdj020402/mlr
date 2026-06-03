@@ -3,9 +3,10 @@ import logging
 import os
 import sys
 
-from .dataset import ParquetDataset, CSVDataset, MemoryDataset
+from .dataset import ParquetDataset, CSVDataset, MemoryDataset, split_dataset
 from .regression import MLR
 from .converter import csv_to_parquet, ParquetWriter
+from .validation import cross_validate
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ def setup_logging(level: str = "INFO") -> None:
     handler.setLevel(level.upper())
 
     # Configure all mlr sub-loggers
-    for sub in ("mlr", "mlr.dataset", "mlr.regression", "mlr.converter"):
+    for sub in ("mlr", "mlr.dataset", "mlr.regression", "mlr.converter", "mlr.validation"):
         sub_logger = logging.getLogger(sub)
         sub_logger.handlers = []
         sub_logger.addHandler(handler)

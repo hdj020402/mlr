@@ -12,8 +12,8 @@ OLS (method="ols")
 
     All-zero feature columns are automatically detected and excluded
     from the solve to avoid singular matrix issues.  These columns
-    receive coefficient 0.  The excluded column indices are stored
-    in ``model.zero_col_indices``.
+    receive coefficient 0.  The excluded column names are stored
+    in ``model.zero_col_features``.
 
 Ridge (method="ridge")
     Exact solution via the same batched Normal Equations as OLS, with an
@@ -32,16 +32,18 @@ Iterative methods (method="lasso" | "elasticnet" | "huber")
 Public interface
 ----------------
     model = MLR(method="ols")
-    model.fit(dataset)                       # dataset is any object with .iter_batches()
-                                             # and .feature_names
-    model.fit(dataset, metrics=["MAE", "RMSE"])  # optionally select metrics
-    pred  = model.predict(X)                 # numpy array
-    coef  = model.coefficients               # dict {name: value, ..., "intercept": value}
-    model.zero_col_features                # list of excluded all-zero feature names
+    result = model.fit(dataset)                      # {"metrics": {"train": {...}}}
+    result = model.fit(dataset, test_size=0.2)       # {"metrics": {"train": {...}, "test": {...}}}
+    result = model.fit(dataset, test_size=0.2,
+                       val_size=0.1)                 # {"metrics": {"train": {...}, "val": {...}, "test": {...}}}
+    pred  = model.predict(X)                         # numpy array
+    model.evaluate(dataset)                          # compute metrics on any dataset
+    coef  = model.coefficients                       # dict {name: value, ..., "intercept": value}
+    model.zero_col_features                          # list of excluded all-zero feature names
     model.save("coef.json")
     model.load("coef.json")
-    model.save_predictions(dataset, "pred.parquet")   # save fitted values
-    model.save_predictions(X, "pred.parquet")         # save predictions on new data
+    model.save_predictions(dataset, "pred.parquet")  # save fitted values
+    model.save_predictions(X, "pred.parquet")        # save predictions on new data
 
 Available metrics: ``"MAE"``, ``"R2"``, ``"MSE"``, ``"RMSE"``.
 Defaults to computing all four.
@@ -52,8 +54,8 @@ Example:
     >>>
     >>> ds = CSVDataset("data.csv", feature_columns=["a", "b"], target_column="y")
     >>> model = MLR(method="ols")
-    >>> metrics = model.fit(ds)
-    >>> print(metrics)          # {"MAE": ..., "R2": ..., "MSE": ..., "RMSE": ...}
+    >>> result = model.fit(ds, test_size=0.2)
+    >>> print(result)          # {"train": {...}, "test": {...}}
     >>> model.save("coef.json")
 """
 
@@ -70,6 +72,8 @@ from sklearn.linear_model import (
     Lasso,
 )
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from .dataset import split_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -141,32 +145,10 @@ class MLR:
 
     _VALID_METRICS = {"MAE", "R2", "MSE", "RMSE"}
 
-    def fit(
-        self,
-        dataset,
-        metrics: list[str] | None = None,
-    ) -> dict[str, float]:
-        """Fit the model on a dataset.
-
-        Args:
-            dataset: Any object that provides:
-                       .feature_names   – list[str]
-                       .iter_batches()  – yields (X_batch, y_batch) numpy arrays
-            metrics:   List of metric names to compute.  Valid options:
-                       ``"MAE"``, ``"R2"``, ``"MSE"``, ``"RMSE"``.
-                       Defaults to all four.
-
-        Returns:
-            Dict with requested training-set metrics.
-        """
-        self.feature_names = list(dataset.feature_names)
-        logger.info(
-            f"Fitting model: method={self.method}, "
-            f"features={len(self.feature_names)}"
-        )
-
+    def _normalise_metrics(self, metrics: list[str] | None) -> list[str]:
+        """Validate and normalise metric names to uppercase."""
         if metrics is None:
-            metrics = list(self._VALID_METRICS)
+            return list(self._VALID_METRICS)
         metrics = [m.upper() for m in metrics]
         invalid = set(metrics) - self._VALID_METRICS
         if invalid:
@@ -174,13 +156,97 @@ class MLR:
                 f"Unknown metrics: {invalid}. "
                 f"Valid options: {sorted(self._VALID_METRICS)}."
             )
+        return metrics
 
+    def _dispatch_fit(self, dataset) -> None:
+        """Route fitting to the correct internal method (no metrics computed)."""
+        self.feature_names = list(dataset.feature_names)
+        logger.info(
+            f"Fitting model: method={self.method}, "
+            f"features={len(self.feature_names)}"
+        )
         if self.method == "ols":
-            return self._fit_ols(dataset, metrics)
+            self._fit_ols(dataset)
         elif self.method == "ridge":
-            return self._fit_ridge(dataset, metrics)
+            self._fit_ridge(dataset)
         else:
-            return self._fit_sklearn(dataset, metrics)
+            self._fit_sklearn(dataset)
+
+    def evaluate(
+        self,
+        dataset,
+        metrics: list[str] | None = None,
+    ) -> dict[str, float]:
+        """Compute metrics on a dataset without re-fitting.
+
+        Args:
+            dataset: Any object with ``.iter_batches()`` and ``.feature_names``.
+            metrics:  Metric names to compute.  Defaults to all four.
+
+        Returns:
+            Dict like ``{"MAE": 0.5, "R2": 0.8, ...}``.
+
+        Raises:
+            RuntimeError: If the model has not been fitted or loaded.
+        """
+        if self.coef_ is None:
+            raise RuntimeError("Model has not been fitted or loaded.")
+        metrics = self._normalise_metrics(metrics)
+        return self._eval_metrics(dataset, metrics)
+
+    def fit(
+        self,
+        dataset,
+        metrics: list[str] | None = None,
+        test_size: float | None = None,
+        val_size: float = 0.0,
+        random_state: int | None = None,
+    ) -> dict:
+        """Fit the model on a dataset.
+
+        Args:
+            dataset:      Any object with ``.feature_names`` and
+                          ``.iter_batches()``.
+            metrics:      Metric names to compute.  Defaults to all four.
+            test_size:    If not None, fraction of data to hold out as the
+                          test set.  Must be in (0, 1).
+            val_size:     Fraction of data to hold out as a validation set.
+                          Only used when *test_size* is not None.
+                          Must be in [0, 1 - test_size).  Default 0.
+            random_state: Seed for reproducible splits.
+
+        Returns:
+            - ``{"metrics": {"train": {...}}}`` when *test_size* is None.
+            - ``{"metrics": {"train": {...}, "test": {...}}}`` when
+              *test_size* is set and *val_size* is 0.
+            - ``{"metrics": {"train": {...}, "val": {...}, "test": {...}}}``
+              when both *test_size* and *val_size* are set.
+        """
+        metrics = self._normalise_metrics(metrics)
+
+        if test_size is None:
+            self._dispatch_fit(dataset)
+            return {"metrics": {"train": self.evaluate(dataset, metrics)}}
+
+        # Split into train / [val] / test
+        splits = split_dataset(
+            dataset,
+            test_size=test_size,
+            val_size=val_size,
+            random_state=random_state,
+        )
+        if val_size > 0:
+            train_ds, val_ds, test_ds = splits
+        else:
+            train_ds, test_ds = splits
+
+        self._dispatch_fit(train_ds)
+
+        result: dict = {"train": self.evaluate(train_ds, metrics)}
+        if val_size > 0:
+            result["val"] = self.evaluate(val_ds, metrics)
+        result["test"] = self.evaluate(test_ds, metrics)
+        return {"metrics": result}
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict targets for feature matrix X.
@@ -323,7 +389,7 @@ class MLR:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _fit_ols(self, dataset, metrics: list[str]) -> dict[str, float]:
+    def _fit_ols(self, dataset) -> None:
         """Exact OLS via batched Normal Equations accumulation.
 
         Uses a two-pass approach:
@@ -402,9 +468,8 @@ class MLR:
                 self.intercept_ = 0.0
 
         self.n_samples_ = n_total
-        return self._eval_metrics(dataset, metrics)
 
-    def _fit_ridge(self, dataset, metrics: list[str]) -> dict[str, float]:
+    def _fit_ridge(self, dataset) -> None:
         """Exact Ridge via batched Normal Equations with L2 penalty.
 
         Uses a two-pass approach:
@@ -488,9 +553,8 @@ class MLR:
                 self.intercept_ = 0.0
 
         self.n_samples_ = n_total
-        return self._eval_metrics(dataset, metrics)
 
-    def _fit_sklearn(self, dataset, metrics: list[str]) -> dict[str, float]:
+    def _fit_sklearn(self, dataset) -> None:
         """Fit a sklearn model after loading all data into memory."""
         X_parts, y_parts = [], []
         for X_batch, y_batch in dataset.iter_batches():
@@ -525,21 +589,9 @@ class MLR:
             sk.intercept_ if np.isscalar(sk.intercept_) else sk.intercept_[0]
         )
 
-        y_pred = sk.predict(X_all)
-        result: dict[str, float] = {}
-        if "MAE" in metrics:
-            result["MAE"] = float(mean_absolute_error(y_all, y_pred))
-        if "MSE" in metrics:
-            result["MSE"] = float(mean_squared_error(y_all, y_pred))
-        if "RMSE" in metrics:
-            result["RMSE"] = float(np.sqrt(mean_squared_error(y_all, y_pred)))
-        if "R2" in metrics:
-            result["R2"] = float(r2_score(y_all, y_pred))
         self.n_samples_ = len(y_all)
-        del X_all, y_all
-
         self.zero_col_features = []  # sklearn handles zero columns naturally
-        return result
+        del X_all, y_all
 
     def _eval_metrics(self, dataset, metrics: list[str]) -> dict[str, float]:
         """Compute requested metrics over the full dataset in batches.
