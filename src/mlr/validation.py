@@ -9,7 +9,7 @@ import logging
 
 import numpy as np
 
-from .dataset import _get_num_rows, _make_subset
+from .dataset import get_num_rows, make_subset
 from .regression import MLR
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ def cross_validate(
     if cv < 2:
         raise ValueError(f"cv must be at least 2, got {cv}")
 
-    n = _get_num_rows(dataset)
+    n = get_num_rows(dataset)
     rng = np.random.RandomState(random_state)
     indices = rng.permutation(n)
 
@@ -72,8 +72,8 @@ def cross_validate(
         train_idx = np.concatenate([indices[:start], indices[end:]])
         start = end
 
-        train_ds = _make_subset(dataset, train_idx.tolist())
-        val_ds = _make_subset(dataset, val_idx.tolist())
+        train_ds = make_subset(dataset, train_idx.tolist())
+        val_ds = make_subset(dataset, val_idx.tolist())
 
         fold_model = MLR(
             method=model.method,

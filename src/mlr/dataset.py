@@ -403,7 +403,7 @@ def _count_csv_rows(csv_path: str) -> int:
     return max(0, n_lines - 1)
 
 
-def _get_num_rows(dataset) -> int:
+def get_num_rows(dataset) -> int:
     """Return the total number of rows for any dataset type."""
     if isinstance(dataset, ParquetDataset):
         return dataset._num_rows
@@ -415,7 +415,7 @@ def _get_num_rows(dataset) -> int:
         raise TypeError(f"Unsupported dataset type: {type(dataset)}")
 
 
-def _make_subset(dataset, indices: list[int]):
+def make_subset(dataset, indices: list[int]):
     """Create a subset of *dataset* containing only the given row indices.
 
     For ParquetDataset and CSVDataset this uses **index_filter** to
@@ -491,7 +491,7 @@ def split_dataset(
             f"val_size must be in [0, {1 - test_size}), got {val_size}"
         )
 
-    n = _get_num_rows(dataset)
+    n = get_num_rows(dataset)
     rng = np.random.RandomState(random_state)
     indices = rng.permutation(n)
 
@@ -506,8 +506,8 @@ def split_dataset(
         val_idx = None
         train_idx = indices[:-n_test] if n_test > 0 else indices
 
-    train_ds = _make_subset(dataset, train_idx.tolist())
-    test_ds = _make_subset(dataset, test_idx.tolist())
+    train_ds = make_subset(dataset, train_idx.tolist())
+    test_ds = make_subset(dataset, test_idx.tolist())
 
     logger.info(
         f"split_dataset: test_size={test_size}, val_size={val_size}, "
@@ -516,6 +516,6 @@ def split_dataset(
     )
 
     if val_size > 0:
-        val_ds = _make_subset(dataset, val_idx.tolist())
+        val_ds = make_subset(dataset, val_idx.tolist())
         return train_ds, val_ds, test_ds
     return train_ds, test_ds

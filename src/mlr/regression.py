@@ -35,9 +35,7 @@ Public interface
     model.fit(dataset)                  # fit the model
     pred  = model.predict(X)            # numpy array
     model.evaluate(dataset)             # compute metrics on any dataset
-    pred  = model.predict(X)                         # numpy array
-    model.evaluate(dataset)                          # compute metrics on any dataset
-    coef  = model.coefficients                       # dict {name: value, ..., "intercept": value}
+    coef  = model.coefficients          # dict {name: value, ..., "intercept": value}
     model.zero_col_features                          # list of excluded all-zero feature names
     model.save("coef.json")
     model.load("coef.json")
@@ -549,9 +547,9 @@ class MLR:
     def _eval_metrics(self, dataset, metrics: list[str]) -> dict[str, float]:
         """Compute requested metrics over the full dataset in batches.
 
-        Uses two passes to avoid storing all predictions in memory:
-        1. Accumulate sums for MAE/MSE and compute y_mean.
-        2. Compute ss_tot for R2 using only y_mean.
+        Accumulates running sums in a single pass so predictions are
+        never stored in memory.  R2 is computed from the accumulated
+        statistics (sum of squares total and residual).
         """
         logger.info("Computing evaluation metrics...")
 
@@ -599,5 +597,5 @@ class MLR:
                 result["R2"] = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
 
         log_parts = [f"{k}={v:.6f}" for k, v in result.items()]
-        logger.info(f"Train metrics: {', '.join(log_parts)}")
+        logger.info(f"Evaluation metrics: {', '.join(log_parts)}")
         return result
