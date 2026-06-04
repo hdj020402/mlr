@@ -82,9 +82,8 @@ def cross_validate(
             huber_epsilon=model.huber_epsilon,
             fit_intercept=model.fit_intercept,
         )
-        fold_model._dispatch_fit(train_ds)
-
-        train_eval = fold_model.evaluate(train_ds, metrics)
+        fit_result = fold_model.fit(train_ds, metrics=metrics)
+        train_eval = fit_result["metrics"]["train"]
         val_eval = fold_model.evaluate(val_ds, metrics)
 
         key = f"fold_{fold + 1}"

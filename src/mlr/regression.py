@@ -70,7 +70,8 @@ from sklearn.linear_model import (
     HuberRegressor,
     Lasso,
 )
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+
 
 
 logger = logging.getLogger(__name__)
@@ -156,20 +157,6 @@ class MLR:
             )
         return metrics
 
-    def _dispatch_fit(self, dataset) -> None:
-        """Route fitting to the correct internal method (no metrics computed)."""
-        self.feature_names = list(dataset.feature_names)
-        logger.info(
-            f"Fitting model: method={self.method}, "
-            f"features={len(self.feature_names)}"
-        )
-        if self.method == "ols":
-            self._fit_ols(dataset)
-        elif self.method == "ridge":
-            self._fit_ridge(dataset)
-        else:
-            self._fit_sklearn(dataset)
-
     def evaluate(
         self,
         dataset,
@@ -208,7 +195,19 @@ class MLR:
             ``{"metrics": {"train": {...}}}``.
         """
         metrics = self._normalise_metrics(metrics)
-        self._dispatch_fit(dataset)
+
+        self.feature_names = list(dataset.feature_names)
+        logger.info(
+            f"Fitting model: method={self.method}, "
+            f"features={len(self.feature_names)}"
+        )
+        if self.method == "ols":
+            self._fit_ols(dataset)
+        elif self.method == "ridge":
+            self._fit_ridge(dataset)
+        else:
+            self._fit_sklearn(dataset)
+
         return {"metrics": {"train": self.evaluate(dataset, metrics)}}
 
     def predict(self, X: np.ndarray) -> np.ndarray:
