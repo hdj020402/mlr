@@ -32,7 +32,7 @@ Iterative methods (method="lasso" | "elasticnet" | "huber")
 Public interface
 ----------------
     model = MLR(method="ols")
-    result = model.fit(dataset)         # {"metrics": {"train": {...}}}
+    model.fit(dataset)                  # fit the model
     pred  = model.predict(X)            # numpy array
     model.evaluate(dataset)             # compute metrics on any dataset
     pred  = model.predict(X)                         # numpy array
@@ -53,8 +53,8 @@ Example:
     >>>
     >>> ds = CSVDataset("data.csv", feature_columns=["a", "b"], target_column="y")
     >>> model = MLR(method="ols")
-    >>> result = model.fit(ds, test_size=0.2)
-    >>> print(result)          # {"train": {...}, "test": {...}}
+    >>> model.fit(ds)
+    >>> print(model.evaluate(ds))  # {"MAE": 0.08, "R2": 0.999, ...}
     >>> model.save("coef.json")
 """
 
@@ -182,20 +182,13 @@ class MLR:
     def fit(
         self,
         dataset,
-        metrics: list[str] | None = None,
-    ) -> dict:
+    ) -> None:
         """Fit the model on a dataset.
 
         Args:
             dataset: Any object with ``.feature_names`` and
                      ``.iter_batches()``.
-            metrics: Metric names to compute.  Defaults to all four.
-
-        Returns:
-            ``{"metrics": {"train": {...}}}``.
         """
-        metrics = self._normalise_metrics(metrics)
-
         self.feature_names = list(dataset.feature_names)
         logger.info(
             f"Fitting model: method={self.method}, "
@@ -207,8 +200,6 @@ class MLR:
             self._fit_ridge(dataset)
         else:
             self._fit_sklearn(dataset)
-
-        return {"metrics": {"train": self.evaluate(dataset, metrics)}}
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict targets for feature matrix X.

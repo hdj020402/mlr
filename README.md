@@ -142,9 +142,9 @@ ds = MemoryDataset(X, y, feature_names=["a", "b", "c"])
 from mlr import MLR
 
 model = MLR(method="ols")
-result = model.fit(ds)
-# result -> {"metrics": {"train": {"MAE": ..., "R2": ..., "MSE": ..., "RMSE": ...}}}
-print(model.coefficients)     # {"a": ..., "b": ..., "c": ..., "intercept": ...}
+model.fit(ds)
+print(model.evaluate(ds))      # {"MAE": ..., "R2": ..., "MSE": ..., "RMSE": ...}
+print(model.coefficients)      # {"a": ..., "b": ..., "c": ..., "intercept": ...}
 ```
 
 `feature_names` are taken from the dataset — no need to pass them separately.
@@ -163,7 +163,7 @@ Raises `RuntimeError` if called before the model is fitted or loaded.
 ### Selecting metrics
 
 ```python
-result = model.fit(ds, metrics=["MAE", "RMSE"])
+model.evaluate(ds, metrics=["MAE", "RMSE"])
 ```
 
 Available metrics: `"MAE"`, `"R2"`, `"MSE"`, `"RMSE"` (default: all four).
@@ -249,7 +249,7 @@ Works with any method, including Lasso and ElasticNet where cross-validation is 
 ## Save and load
 
 ```python
-model.save("coef.json", extra_info=result["metrics"]["train"])
+model.save("coef.json", extra_info=model.evaluate(ds))
 
 model2 = MLR()
 model2.load("coef.json")
