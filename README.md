@@ -149,28 +149,6 @@ print(model.coefficients)     # {"a": ..., "b": ..., "c": ..., "intercept": ...}
 
 `feature_names` are taken from the dataset — no need to pass them separately.
 
-### Train / test split
-
-Pass `test_size` to hold out a fraction of rows for unbiased evaluation:
-
-```python
-result = model.fit(ds, test_size=0.2, random_state=42)
-# result -> {"metrics": {"train": {...}, "test": {...}}}
-print(result["metrics"]["train"]["R2"])   # e.g. 0.9994
-print(result["metrics"]["test"]["R2"])    # e.g. 0.9987
-```
-
-### Train / validation / test split
-
-Pass both `test_size` and `val_size` for a three-way split:
-
-```python
-result = model.fit(ds, test_size=0.2, val_size=0.1, random_state=42)
-# result -> {"metrics": {"train": {...}, "val": {...}, "test": {...}}}
-```
-
-When no split is requested (the default), the model fits on all data and only reports training metrics.
-
 ### Standalone evaluation
 
 Use `evaluate()` to compute metrics on any dataset without re-fitting:
@@ -236,6 +214,14 @@ train_ds, val_ds, test_ds = split_dataset(
 ```
 
 For `MemoryDataset` the arrays are sliced directly. For `ParquetDataset` and `CSVDataset` the existing `index_filter` mechanism is used so no data is copied. The returned subsets are independent dataset objects that can be passed to `MLR.fit()` or `MLR.evaluate()`.
+
+```python
+# Full workflow: split → fit → evaluate
+train_ds, test_ds = split_dataset(ds, test_size=0.2, random_state=42)
+model.fit(train_ds)
+train_metrics = model.evaluate(train_ds)
+test_metrics  = model.evaluate(test_ds)
+```
 
 ---
 

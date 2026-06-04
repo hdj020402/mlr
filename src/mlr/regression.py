@@ -32,10 +32,9 @@ Iterative methods (method="lasso" | "elasticnet" | "huber")
 Public interface
 ----------------
     model = MLR(method="ols")
-    result = model.fit(dataset)                      # {"metrics": {"train": {...}}}
-    result = model.fit(dataset, test_size=0.2)       # {"metrics": {"train": {...}, "test": {...}}}
-    result = model.fit(dataset, test_size=0.2,
-                       val_size=0.1)                 # {"metrics": {"train": {...}, "val": {...}, "test": {...}}}
+    result = model.fit(dataset)         # {"metrics": {"train": {...}}}
+    pred  = model.predict(X)            # numpy array
+    model.evaluate(dataset)             # compute metrics on any dataset
     pred  = model.predict(X)                         # numpy array
     model.evaluate(dataset)                          # compute metrics on any dataset
     coef  = model.coefficients                       # dict {name: value, ..., "intercept": value}
@@ -73,7 +72,6 @@ from sklearn.linear_model import (
 )
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from .dataset import split_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -198,55 +196,20 @@ class MLR:
         self,
         dataset,
         metrics: list[str] | None = None,
-        test_size: float | None = None,
-        val_size: float = 0.0,
-        random_state: int | None = None,
     ) -> dict:
         """Fit the model on a dataset.
 
         Args:
-            dataset:      Any object with ``.feature_names`` and
-                          ``.iter_batches()``.
-            metrics:      Metric names to compute.  Defaults to all four.
-            test_size:    If not None, fraction of data to hold out as the
-                          test set.  Must be in (0, 1).
-            val_size:     Fraction of data to hold out as a validation set.
-                          Only used when *test_size* is not None.
-                          Must be in [0, 1 - test_size).  Default 0.
-            random_state: Seed for reproducible splits.
+            dataset: Any object with ``.feature_names`` and
+                     ``.iter_batches()``.
+            metrics: Metric names to compute.  Defaults to all four.
 
         Returns:
-            - ``{"metrics": {"train": {...}}}`` when *test_size* is None.
-            - ``{"metrics": {"train": {...}, "test": {...}}}`` when
-              *test_size* is set and *val_size* is 0.
-            - ``{"metrics": {"train": {...}, "val": {...}, "test": {...}}}``
-              when both *test_size* and *val_size* are set.
+            ``{"metrics": {"train": {...}}}``.
         """
         metrics = self._normalise_metrics(metrics)
-
-        if test_size is None:
-            self._dispatch_fit(dataset)
-            return {"metrics": {"train": self.evaluate(dataset, metrics)}}
-
-        # Split into train / [val] / test
-        splits = split_dataset(
-            dataset,
-            test_size=test_size,
-            val_size=val_size,
-            random_state=random_state,
-        )
-        if val_size > 0:
-            train_ds, val_ds, test_ds = splits
-        else:
-            train_ds, test_ds = splits
-
-        self._dispatch_fit(train_ds)
-
-        result: dict = {"train": self.evaluate(train_ds, metrics)}
-        if val_size > 0:
-            result["val"] = self.evaluate(val_ds, metrics)
-        result["test"] = self.evaluate(test_ds, metrics)
-        return {"metrics": result}
+        self._dispatch_fit(dataset)
+        return {"metrics": {"train": self.evaluate(dataset, metrics)}}
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict targets for feature matrix X.
