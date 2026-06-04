@@ -98,7 +98,7 @@ def cross_validate(
         }
 
         logger.info(
-            f"Fold {fold + 1}/{cv}: "
+            f"Fold {fold}/{cv}: "
             + "  ".join(f"train_{k}={v:.6f}" for k, v in train_eval.items())
             + "  "
             + "  ".join(f"val_{k}={v:.6f}" for k, v in val_eval.items())
