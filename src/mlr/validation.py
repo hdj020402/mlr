@@ -38,7 +38,7 @@ def cross_validate(
         .. code-block:: python
 
             {
-                "fold_1": {
+                "fold_0": {
                     "method": "ols",
                     "coefficients": {"a": 1.23, "b": 2.0, "intercept": 0.3},
                     "n_samples": 160,
@@ -47,7 +47,7 @@ def cross_validate(
                         "val":   {"MAE": 0.09, "R2": 0.98},
                     },
                 },
-                "fold_2": { ... },
+                "fold_1": { ... },
                 ...
             }
 
@@ -86,7 +86,7 @@ def cross_validate(
         train_eval = fold_model.evaluate(train_ds, metrics)
         val_eval = fold_model.evaluate(val_ds, metrics)
 
-        key = f"fold_{fold + 1}"
+        key = f"fold_{fold}"
         result[key] = {
             "method": fold_model.method,
             "coefficients": fold_model.coefficients,

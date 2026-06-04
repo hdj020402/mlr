@@ -237,8 +237,8 @@ scores = cross_validate(model, ds, cv=5, metrics=["MAE", "R2"], random_state=42)
 
 for fold_name, fold_info in scores.items():
     print(fold_name, fold_info["coefficients"], fold_info["metrics"]["val"]["R2"])
-# fold_1 {'a': 1.23, 'b': -2.01, 'intercept': 0.30} 0.9991
-# fold_2 {'a': 1.25, 'b': -1.98, 'intercept': 0.31} 0.9988
+# fold_0 {'a': 1.23, 'b': -2.01, 'intercept': 0.30} 0.9991
+# fold_1 {'a': 1.25, 'b': -1.98, 'intercept': 0.31} 0.9988
 # ...
 ```
 
