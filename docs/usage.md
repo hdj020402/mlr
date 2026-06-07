@@ -59,22 +59,31 @@ model.save_predictions(test_ds, "test_predictions.parquet")
 ## K-fold cross-validation
 
 ```python
-from mlr import cross_validate
+from mlr import CrossValidator
 
 # -- 1. Run CV --------------------------------------------------------
-scores = cross_validate(MLR(method="ols"), ds, cv=5, random_state=42)
+cv = CrossValidator(MLR(method="ols"), cv=5, random_state=42)
+cv.fit(ds)
 
 # -- 2. Inspect per-fold results --------------------------------------
-for name, fold in scores.items():
-    r2_train = fold["metrics"]["train"]["R2"]
-    r2_val = fold["metrics"]["val"]["R2"]
+for name, metrics in cv.metrics_.items():
+    r2_train = metrics["train"]["R2"]
+    r2_val = metrics["val"]["R2"]
+    coef = cv.coefficients_[name]
     print(f"{name}: train R2={r2_train:.4f}  val R2={r2_val:.4f}  "
-          f"a={fold['coefficients']['a']:.2f}  intercept={fold['coefficients']['intercept']:.2f}")
+          f"a={coef['a']:.2f}  intercept={coef['intercept']:.2f}")
 # fold_0: train R2=0.9994  val R2=0.9994  a=1.49  intercept=0.31
 # fold_1: train R2=0.9995  val R2=0.9994  a=1.49  intercept=0.31
 # ...
 
-# -- 3. Fit final model on all data -----------------------------------
+# -- 3. Get predictions (lazy — computed on first access) --------------
+val_preds = cv.predictions("val")   # {"fold_0": ndarray, ...}
+val_y     = cv.actuals("val")       # {"fold_0": ndarray, ...}
+# Residual analysis, custom metrics, etc.
+for name in cv.metrics_:
+    residuals = val_preds[name] - val_y[name]
+
+# -- 4. Fit final model on all data -----------------------------------
 model = MLR(method="ols")
 model.fit(ds)
 model.save("coef.json", extra_info=model.evaluate(ds))
@@ -86,10 +95,10 @@ model.save("coef.json", extra_info=model.evaluate(ds))
 # -- 1. Try several alpha values --------------------------------------
 best_alpha, best_r2 = None, -float("inf")
 for alpha in [0.001, 0.01, 0.1, 1.0, 10.0]:
-    cv = cross_validate(
-        MLR(method="lasso", alpha=alpha), ds, cv=5, random_state=42,
-    )
-    mean_val_r2 = np.mean([f["metrics"]["val"]["R2"] for f in cv.values()])
+    cv = CrossValidator(
+        MLR(method="lasso", alpha=alpha), cv=5, random_state=42,
+    ).fit(ds)
+    mean_val_r2 = np.mean([m["val"]["R2"] for m in cv.metrics_.values()])
     print(f"alpha={alpha:.3f}  mean val R2={mean_val_r2:.4f}")
     if mean_val_r2 > best_r2:
         best_alpha, best_r2 = alpha, mean_val_r2

@@ -6,7 +6,7 @@ import sys
 from .dataset import ParquetDataset, CSVDataset, MemoryDataset, split_dataset
 from .regression import MLR
 from .converter import csv_to_parquet, ParquetWriter
-from .validation import cross_validate
+from .validation import CrossValidator
 
 logger = logging.getLogger(__name__)
 

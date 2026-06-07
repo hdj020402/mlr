@@ -27,7 +27,7 @@ src/mlr/
 ├── converter.py   # ParquetWriter, csv_to_parquet
 ├── dataset.py     # ParquetDataset, CSVDataset, MemoryDataset, split_dataset
 ├── regression.py  # MLR
-└── validation.py  # cross_validate
+└── validation.py  # CrossValidator
 ```
 
 ---
@@ -234,19 +234,23 @@ test_metrics  = model.evaluate(test_ds)
 
 ## Cross-validation
 
-K-fold cross-validation is provided by `cross_validate`. It clones the model template for each fold, fits on the training portion, and returns per-fold results including coefficients, training metrics, and validation metrics.
+K-fold cross-validation is provided by `CrossValidator`. It clones the model template for each fold, fits on the training portion, and provides eager access to metrics/coefficients plus lazy access to predictions and actuals.
 
 ```python
-from mlr import cross_validate, MLR
+from mlr import CrossValidator
 
-model = MLR(method="ols")
-scores = cross_validate(model, ds, cv=5, metrics=["MAE", "R2"], random_state=42)
+cv = CrossValidator(MLR(method="ols"), cv=5, metrics=["MAE", "R2"], random_state=42)
+cv.fit(ds)
 
-for fold_name, fold_info in scores.items():
-    print(fold_name, fold_info["coefficients"], fold_info["metrics"]["val"]["R2"])
+for name, metrics in cv.metrics_.items():
+    print(name, cv.coefficients_[name], metrics["val"]["R2"])
 # fold_0 {'a': 1.23, 'b': -2.01, 'intercept': 0.30} 0.9991
 # fold_1 {'a': 1.25, 'b': -1.98, 'intercept': 0.31} 0.9988
 # ...
+
+# Lazy: predictions and actuals computed on first access
+val_preds = cv.predictions("val")
+val_y     = cv.actuals("val")
 ```
 
 Works with any method, including Lasso and ElasticNet where cross-validation is essential for tuning the regularisation strength.
